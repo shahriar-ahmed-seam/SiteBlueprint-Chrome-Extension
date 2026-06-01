@@ -70,13 +70,30 @@
 
         <div class="form-group toggle-group">
           <div class="toggle-text">
-            <span class="toggle-label">Save CDN & External Assets</span>
+            <span class="toggle-label">Save CDN &amp; External Assets</span>
             <span class="toggle-desc">Download stylesheet, script, and image files hosted on external domains.</span>
           </div>
           <label class="switch">
             <input type="checkbox" id="save-external" checked>
             <span class="slider round"></span>
           </label>
+        </div>
+
+        <div class="form-group toggle-group freeze-mode-group">
+          <div class="toggle-text">
+            <span class="toggle-label">❄ Freeze Live Data</span>
+            <span class="toggle-desc">Open each page in a real browser tab and capture the fully rendered DOM — including AJAX-loaded tables, charts, and dynamic content.</span>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="freeze-mode">
+            <span class="slider round amber"></span>
+          </label>
+        </div>
+
+        <div class="form-group" id="freeze-wait-group" style="display:none;">
+          <label for="freeze-wait">Data Render Wait (ms)</label>
+          <input type="number" id="freeze-wait" value="2500" min="500" step="250">
+          <span class="input-hint">Extra time to wait after page load for AJAX data to render. Increase for slow APIs (e.g. 4000ms).</span>
         </div>
       </div>
 

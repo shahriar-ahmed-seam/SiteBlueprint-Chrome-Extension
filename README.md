@@ -89,6 +89,71 @@ To load the extension locally in your Google Chrome browser:
 
 ---
 
+## 🗂️ Opening Your Offline Blueprint
+
+After extracting the downloaded ZIP, you get a fully self-contained folder (e.g. `example_com_blueprint/`). Here's how to browse it:
+
+### Option 1 — Open Directly in Browser (Easiest)
+Double-click the main entry file (usually `index.html` or `home.html`) in the extracted folder. Chrome's built-in `file://` protocol will load it and the injected `_blueprint_nav.js` router handles internal page navigation automatically.
+
+> **Note:** Some dynamic features (web workers, certain fonts) may be restricted by the browser's `file://` security policy.
+
+### Option 2 — Serve via Local HTTP Server (Recommended)
+For the most accurate offline experience, serve the folder through a local web server:
+
+**Using Node.js (npx):**
+```bash
+npx http-server /path/to/extracted-blueprint -p 8000
+# Then open: http://localhost:8000/home.html
+```
+
+**Using Python:**
+```bash
+cd /path/to/extracted-blueprint
+python -m http.server 8000
+# Then open: http://localhost:8000/home.html
+```
+
+**On Windows:**
+```powershell
+cd "C:\Users\YourName\Downloads\example_com_blueprint"
+python -m http.server 8000
+# Then open: http://localhost:8000/home.html
+```
+
+The injected router (`_blueprint_nav.js`) intercepts all link clicks and redirects you to the correct local `.html` file — meaning navigation works exactly like the live site, just offline.
+
+---
+
+## ❄️ Freeze Live Data Mode
+
+By default, SiteBlueprint uses `fetch()` to download each page. This is fast and works well for **server-rendered websites** (e.g. PHP, Laravel Blade, Django, Rails). However, many modern apps load their actual data **after** the page loads via JavaScript AJAX calls — meaning you'd see empty tables and blank charts offline.
+
+**Freeze Live Data** solves this. When enabled, instead of `fetch()`, the crawler:
+1. Opens each URL in a **real background Chrome tab**
+2. Waits for the page and all AJAX calls to complete
+3. Captures `document.documentElement.outerHTML` — the **fully rendered DOM with data baked in**
+4. Closes the tab and saves the frozen HTML
+
+The result is a true **data snapshot** — every table, chart, and list reflects exactly what was on screen at crawl time.
+
+### When to use Freeze Mode
+| Scenario | Recommended Mode |
+|---|---|
+| Static site, blog, marketing page | Normal (fast) |
+| Server-rendered app (Laravel, Django, Rails) | Normal (fast) |
+| React / Vue / Angular SPA | **Freeze Mode** |
+| Dashboard with DataTables or Chart.js | **Freeze Mode** |
+| Any app where tables show "No data" offline | **Freeze Mode** |
+
+### Freeze Mode Settings
+- **Data Render Wait (ms)**: How long to wait after the page loads before capturing. Default is `2500ms`. Increase to `4000–6000ms` for slow APIs or dashboards with many widgets.
+- Freeze mode is **slower** — each page takes at least `render wait + page load time`. Set a longer Crawl Delay (500–1000ms) to be gentle on the server.
+
+---
+
+---
+
 ## ⚙️ Technical Deep Dive
 
 ### 1. Relative Path Rewriting

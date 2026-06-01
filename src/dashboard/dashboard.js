@@ -6,6 +6,10 @@ document.addEventListener('DOMContentLoaded', () => {
   const crawlDelayInput = document.getElementById('crawl-delay');
   const excludePatternsInput = document.getElementById('exclude-patterns');
   const saveExternalCheckbox = document.getElementById('save-external');
+  const freezeModeCheckbox = document.getElementById('freeze-mode');
+  const freezeWaitInput = document.getElementById('freeze-wait');
+  const freezeWaitGroup = document.getElementById('freeze-wait-group');
+  const freezeModeGroup = document.querySelector('.freeze-mode-group');
   const startBtn = document.getElementById('start-btn');
   const stopBtn = document.getElementById('stop-btn');
   const downloadZipBtn = document.getElementById('download-zip-btn');
@@ -38,6 +42,8 @@ document.addEventListener('DOMContentLoaded', () => {
   let maxDepth = 3;
   let crawlDelay = 300;
   let saveExternal = true;
+  let freezeMode = false;   // When true, capture real rendered DOM via tab
+  let freezeWait = 2500;   // ms to wait after page load for AJAX data
   let elapsedSeconds = 0;
   
   // Queues and Lists
@@ -88,6 +94,16 @@ document.addEventListener('DOMContentLoaded', () => {
       domainBadge.textContent = url.hostname;
     } catch(err) {
       domainBadge.textContent = 'Invalid URL';
+    }
+  });
+
+  // Freeze mode toggle wiring
+  freezeModeCheckbox.addEventListener('change', () => {
+    const isOn = freezeModeCheckbox.checked;
+    freezeWaitGroup.style.display = isOn ? 'flex' : 'none';
+    freezeModeGroup.classList.toggle('active', isOn);
+    if (isOn) {
+      log('❄ Freeze Live Data mode enabled. Pages will be opened in background tabs to capture real rendered DOM with AJAX data.', 'freeze');
     }
   });
 
@@ -426,6 +442,8 @@ document.addEventListener('DOMContentLoaded', () => {
     maxDepth = parseInt(maxDepthSelect.value);
     crawlDelay = parseInt(crawlDelayInput.value);
     saveExternal = saveExternalCheckbox.checked;
+    freezeMode = freezeModeCheckbox.checked;
+    freezeWait = parseInt(freezeWaitInput.value) || 2500;
     
     zip = new JSZip();
     
@@ -448,7 +466,10 @@ document.addEventListener('DOMContentLoaded', () => {
     domainBadge.textContent = new URL(startUrl).hostname;
     
     log(`Initializing SiteBlueprint crawler core for: ${startUrl}`, 'system');
-    log(`Options configured - Max Depth: ${maxDepth === 999 ? 'Unlimited' : maxDepth}, Delay: ${crawlDelay}ms, Save CDNs: ${saveExternal}`, 'system');
+    log(`Options configured - Max Depth: ${maxDepth === 999 ? 'Unlimited' : maxDepth}, Delay: ${crawlDelay}ms, Save CDNs: ${saveExternal}, Freeze Mode: ${freezeMode ? '❄ ON (render wait: ' + freezeWait + 'ms)' : 'off'}`, 'system');
+    if (freezeMode) {
+      log('❄ Freeze mode: each page will be loaded in a real browser tab. Data visible in Chrome will be frozen into the saved HTML.', 'freeze');
+    }
     
     // Start elapsed timer
     statTime.textContent = '00:00';
@@ -478,6 +499,103 @@ document.addEventListener('DOMContentLoaded', () => {
     log('Crawl sequence stopped by user. Compiling currently fetched resources...', 'warn');
     isRunning = false;
     finalizeCrawl();
+  }
+
+  // ==========================================================================
+  // Page Fetching: fetch() mode vs. Freeze (tab-based DOM capture) mode
+  // ==========================================================================
+
+  /**
+   * Unified page fetch entry point.
+   * In normal mode  : uses fetch() with credentials (fast, no JS rendering).
+   * In freeze mode  : opens a background Chrome tab, waits for the page to
+   *                   fully render (including AJAX data), captures outerHTML,
+   *                   then closes the tab.
+   * Returns { htmlText, finalUrl, contentType }
+   */
+  async function fetchPageHtml(url) {
+    if (!freezeMode) {
+      // ── Standard fetch path ───────────────────────────────────────────────
+      const response = await fetch(url, { credentials: 'include' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const contentType = response.headers.get('Content-Type') || '';
+      const finalUrl = response.url;
+      const htmlText = contentType.includes('text/html') ? await response.text() : '';
+      return { htmlText, finalUrl, contentType };
+    }
+
+    // ── Freeze mode: tab-based DOM capture ────────────────────────────────
+    return new Promise((resolve, reject) => {
+      let tabId = null;
+      let settled = false;
+      const TIMEOUT = Math.max(freezeWait + 15000, 20000); // hard safety timeout
+
+      const cleanup = () => {
+        if (tabId !== null) {
+          chrome.tabs.remove(tabId, () => { /* ignore */ });
+          tabId = null;
+        }
+      };
+
+      const fail = (msg) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(new Error(msg));
+      };
+
+      // Safety timeout so a hung page never blocks the queue forever
+      const timeoutHandle = setTimeout(() => fail(`Freeze timeout after ${TIMEOUT}ms`), TIMEOUT);
+
+      // Listen for the tab finishing loading
+      const onUpdated = (tid, changeInfo) => {
+        if (tid !== tabId || changeInfo.status !== 'complete') return;
+        chrome.tabs.onUpdated.removeListener(onUpdated);
+
+        // Wait extra time for AJAX/JS to render data
+        setTimeout(async () => {
+          if (settled) return;
+          try {
+            // Capture the tab's final URL (handle redirects)
+            const tab = await chrome.tabs.get(tabId);
+            const finalUrl = tab.url || url;
+            const contentType = finalUrl.match(/\.(css|js|png|jpg|jpeg|gif|webp|svg|ico|woff|woff2|ttf|eot)($|\?)/i)
+              ? 'application/octet-stream'
+              : 'text/html';
+
+            // Inject script to capture fully rendered outerHTML
+            const results = await chrome.scripting.executeScript({
+              target: { tabId: tabId },
+              func: () => document.documentElement.outerHTML
+            });
+
+            const htmlText = (results && results[0] && results[0].result) || '';
+            clearTimeout(timeoutHandle);
+            settled = true;
+            cleanup();
+            resolve({ htmlText, finalUrl, contentType });
+          } catch (err) {
+            fail(`Tab scripting error: ${err.message}`);
+          }
+        }, freezeWait);
+      };
+
+      chrome.tabs.onUpdated.addListener(onUpdated);
+
+      // Open a background (inactive) tab
+      chrome.tabs.create({ url, active: false }, (tab) => {
+        if (chrome.runtime.lastError) {
+          chrome.tabs.onUpdated.removeListener(onUpdated);
+          fail(`Tab creation error: ${chrome.runtime.lastError.message}`);
+          return;
+        }
+        tabId = tab.id;
+        // If tab is already complete (e.g. cached page), fire immediately
+        if (tab.status === 'complete') {
+          onUpdated(tabId, { status: 'complete' });
+        }
+      });
+    });
   }
 
   // ---- Login / Auth redirect detection helpers ----
@@ -516,17 +634,11 @@ document.addEventListener('DOMContentLoaded', () => {
         continue;
       }
       
-      log(`Loading target: ${current.url}`, 'info');
+      log(`${freezeMode ? '❄ Freezing' : 'Loading'} target: ${current.url}`, 'info');
       updateTableStatus(current.url, 'downloading');
       
       try {
-        const response = await fetch(current.url, { credentials: 'include' });
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-        
-        const finalUrl = response.url;
-        const contentType = response.headers.get('Content-Type') || '';
+        const { htmlText, finalUrl, contentType } = await fetchPageHtml(current.url);
 
         // ── Auth redirect detection ─────────────────────────────────────────
         if (isRedirectedToLogin(current.url, finalUrl)) {
@@ -539,7 +651,6 @@ document.addEventListener('DOMContentLoaded', () => {
           // If this is the FIRST auth redirect (login page itself), save it once
           if (!localPathIndex.has('login.html') && !visited.has(finalUrl)) {
             const loginLocalPath = getLocalPathForUrl(finalUrl, startUrl);
-            const htmlText = await response.text();
             const parser = new DOMParser();
             const doc = parser.parseFromString(htmlText, 'text/html');
             processHtmlDocument(doc, finalUrl, current.depth);
@@ -587,9 +698,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         
         if (contentType.includes('text/html')) {
-          const htmlText = await response.text();
-          
-          // Parse DOM
+          // Parse DOM (htmlText already resolved above)
           const parser = new DOMParser();
           const doc = parser.parseFromString(htmlText, 'text/html');
           
@@ -629,7 +738,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         
       } catch (err) {
-        log(`Fetch failure on: ${current.url} - ${err.message}`, 'err');
+        log(`${freezeMode ? 'Freeze' : 'Fetch'} failure on: ${current.url} - ${err.message}`, 'err');
         updateTableStatus(current.url, 'error');
       }
       
