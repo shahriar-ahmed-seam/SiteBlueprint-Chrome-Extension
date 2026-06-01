@@ -72,7 +72,7 @@ To load the extension locally in your Google Chrome browser:
 
 ## 📖 Usage Walkthrough
 
-1.  **Navigate to the Target Website**: Open Chrome and visit the website you want to compile (e.g. `https://pos.gloriousit.xyz/`).
+1.  **Navigate to the Target Website**: Open Chrome and visit the website you want to compile.
 2.  **Open the Extension Popup**: Click the SiteBlueprint extension icon from your Chrome toolbar.
 3.  **Launch the Dashboard**: Click **Launch Dashboard**. The extension will open the full-tab control panel, pre-populating the target URL.
 4.  **Configure Settings**:
