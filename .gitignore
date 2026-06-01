@@ -1,0 +1,19 @@
+# OS junk files
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+.DS_Store
+
+# Local Crawler ZIP downloads
+*.zip
+_offline_debug/
+
+# Editor files & folders
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp

@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "SiteBlueprint",
+  "version": "1.0.0",
+  "description": "Crawl and download any website as a clean, fully-functional offline local project.",
+  "permissions": [
+    "activeTab",
+    "downloads",
+    "scripting"
+  ],
+  "host_permissions": [
+    "*://*/*"
+  ],
+  "action": {
+    "default_popup": "src/popup/popup.html",
+    "default_title": "Launch SiteBlueprint",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  }
+}
