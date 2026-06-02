@@ -1,4 +1,4 @@
-﻿// SiteBlueprint Dashboard Scraper Engine
+// SiteBlueprint Dashboard Scraper Engine
 document.addEventListener('DOMContentLoaded', () => {
   // UI Elements
   const startUrlInput = document.getElementById('start-url');
@@ -740,18 +740,19 @@ document.addEventListener('DOMContentLoaded', () => {
           updateTableStatus(current.url, 'success', localPath, serializedHtml.length);
           
         } else {
-          // Dynamic content that isn't html, store as asset
-          log(`Asset content-type detected on page fetch: ${contentType}. Storing as blob.`, 'warn');
-          const blob = await response.blob();
+          // Non-HTML content type from a page URL — store the raw text as-is
+          // (In freeze mode we only get text; in fetch mode we'd need a re-fetch
+          //  for a true blob, but page URLs rarely serve binary content.)
+          const rawText = htmlText || '';
           
-          zip.file(localPath, blob);
+          zip.file(localPath, rawText);
           localPathIndex.add(localPath);
           stats.assetsGathered++;
-          stats.totalSize += blob.size;
+          stats.totalSize += rawText.length;
           stats.counts.other++;
           
-          log(`Saved binary resource: ${localPath} (${formatBytes(blob.size)})`, 'ok');
-          updateTableStatus(current.url, 'success', localPath, blob.size);
+          log(`Saved non-HTML resource: ${localPath} (${formatBytes(rawText.length)})`, 'ok');
+          updateTableStatus(current.url, 'success', localPath, rawText.length);
         }
         
       } catch (err) {
