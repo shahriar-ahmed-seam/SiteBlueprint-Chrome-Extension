@@ -45,6 +45,7 @@ document.addEventListener('DOMContentLoaded', () => {
   let freezeMode = false;   // When true, capture real rendered DOM via tab
   let freezeWait = 2500;   // ms to wait after page load for AJAX data
   let elapsedSeconds = 0;
+  let usedFreezeMode = false; // Track if any page was frozen (for shim file inclusion)
   
   // Queues and Lists
   let queue = []; // Array of { url: '', depth: 0 }
@@ -444,6 +445,7 @@ document.addEventListener('DOMContentLoaded', () => {
     saveExternal = saveExternalCheckbox.checked;
     freezeMode = freezeModeCheckbox.checked;
     freezeWait = parseInt(freezeWaitInput.value) || 2500;
+    usedFreezeMode = freezeMode; // track for finalizeCrawl
     
     zip = new JSZip();
     
@@ -564,6 +566,21 @@ document.addEventListener('DOMContentLoaded', () => {
               : 'text/html';
 
             // Inject script to capture fully rendered outerHTML
+            // First, inject the freeze shim inline so DataTables AJAX calls
+            // are blocked BEFORE outerHTML is serialised (the shim stays in
+            // the HTML and runs again when the user opens the local page).
+            const shimScript = generateFreezeShimInlineCode();
+            await chrome.scripting.executeScript({
+              target: { tabId: tabId },
+              func: (shim) => {
+                const s = document.createElement('script');
+                s.id = '__bp_shim_marker__';
+                s.textContent = shim;
+                (document.head || document.documentElement).prepend(s);
+              },
+              args: [shimScript]
+            });
+
             const results = await chrome.scripting.executeScript({
               target: { tabId: tabId },
               func: () => document.documentElement.outerHTML
@@ -1126,6 +1143,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Injects the __BP_DEPTH__ marker and a reference to _blueprint_nav.js into
   // each saved page so links & SPA routing work locally.
+  // For frozen pages the freeze shim is ALREADY embedded inline by the tab
+  // capture step; we add a reference to the external file only as a fallback.
   function injectOfflineNav(doc, localPath) {
     const depth = localPath.split('/').length - 1;
     const rel = depth > 0 ? '../'.repeat(depth) : '';
@@ -1142,7 +1161,168 @@ document.addEventListener('DOMContentLoaded', () => {
       doc.head.appendChild(depthScript);
       doc.head.appendChild(navScript);
     }
+
+    // For freeze-mode pages that were NOT processed through the tab capture
+    // (e.g. the login redirect page saved from normal fetch), inject shim inline.
+    if (freezeMode && !doc.getElementById('__bp_shim_marker__')) {
+      const shimScript = doc.createElement('script');
+      shimScript.id = '__bp_shim_marker__';
+      shimScript.textContent = generateFreezeShimInlineCode();
+      doc.head.insertBefore(shimScript, doc.head.firstChild);
+    }
   }
+
+  // ==========================================================================
+  // Freeze Shim: blocks XHR/fetch & patches DataTables for offline use
+  // ==========================================================================
+
+  /**
+   * Returns the JS source for the freeze shim that is embedded inline into
+   * every frozen HTML page.  It runs before any page JS and:
+   *   1. Replaces XMLHttpRequest with a stub that returns empty JSON {}  for
+   *      same-origin and relative requests (prevents DataTables "Invalid JSON"
+   *      alerts and similar AJAX errors).
+   */
+  function generateFreezeShimInlineCode() {
+    return `/* SiteBlueprint Freeze Shim — auto-injected, do not edit */
+(function(){
+'use strict';
+if(window.__BP_SHIM_ACTIVE__) return;
+window.__BP_SHIM_ACTIVE__ = true;
+
+// ── 0. Suppress DataTables alert dialogs ────────────────────────────────────
+var _nativeAlert = window.alert;
+window.alert = function(msg) {
+  if (typeof msg === 'string' && msg.indexOf('DataTables warning') !== -1) {
+    console.warn('[SiteBlueprint Freeze] Suppressed DataTables alert:', msg);
+    return;
+  }
+  return _nativeAlert.apply(this, arguments);
+};
+
+// ── 1. XMLHttpRequest stub ──────────────────────────────────────────────────
+var _NativeXHR = window.XMLHttpRequest;
+function FrozenXHR() {
+  var real = new _NativeXHR();
+  var _isFrozen = false;
+  this.open = function(method, url) {
+    try {
+      var abs = new URL(url, window.location.href);
+      _isFrozen = (abs.origin === window.location.origin || abs.protocol === 'file:');
+    } catch(e) { _isFrozen = !(/^https?:\/\//.test(url)); }
+    if (!_isFrozen) { real.open.apply(real, arguments); }
+  };
+  this.send = function(body) {
+    if (!_isFrozen) { real.send.apply(real, arguments); return; }
+    var self = this;
+    self.readyState = 4;
+    self.status = 200;
+    self.statusText = 'OK';
+    self.responseText = '{"draw":0,"recordsTotal":0,"recordsFiltered":0,"data":[]}';
+    self.response = self.responseText;
+    setTimeout(function() {
+      if (typeof self.onload === 'function') { try { self.onload({}); } catch(e){} }
+      if (typeof self.onreadystatechange === 'function') { try { self.onreadystatechange({}); } catch(e){} }
+    }, 0);
+  };
+  this.setRequestHeader = function(k, v) { if (!_isFrozen) real.setRequestHeader(k, v); };
+  this.abort = function() { if (!_isFrozen) real.abort(); };
+  this.addEventListener = function(evt, fn) { if (!_isFrozen) real.addEventListener(evt, fn); };
+  this.removeEventListener = function(evt, fn) { if (!_isFrozen) real.removeEventListener(evt, fn); };
+  this.overrideMimeType = function(m) { try { real.overrideMimeType(m); } catch(e){} };
+  ['timeout','withCredentials','responseType'].forEach(function(p) {
+    Object.defineProperty(this, p, {
+      get: function() { return real[p]; },
+      set: function(v) { try { real[p] = v; } catch(e){} },
+      configurable: true
+    });
+  }, this);
+}
+window.XMLHttpRequest = FrozenXHR;
+
+// ── 2. fetch() stub ─────────────────────────────────────────────────────────
+var _nativeFetch = window.fetch;
+window.fetch = function(input, init) {
+  var url = (typeof input === 'string') ? input : ((input && input.url) || '');
+  var isFrozen = false;
+  try {
+    var abs2 = new URL(url, window.location.href);
+    isFrozen = (abs2.origin === window.location.origin || abs2.protocol === 'file:');
+  } catch(e) { isFrozen = !(/^https?:\/\//.test(url)); }
+  if (isFrozen) {
+    var emptyJson = '{"draw":0,"recordsTotal":0,"recordsFiltered":0,"data":[]}';
+    return Promise.resolve(new Response(emptyJson, {
+      status: 200,
+      headers: {'Content-Type': 'application/json'}
+    }));
+  }
+  return _nativeFetch.apply(this, arguments);
+};
+
+// ── 3. DataTables / jQuery patch ────────────────────────────────────────────
+// Poll until jQuery and DataTables are available, then patch them.
+var _dtPatched = false;
+function patchDataTables() {
+  if (!window.jQuery) return;
+  var $ = window.jQuery;
+  if ($.fn.dataTable && $.fn.dataTable.ext) {
+    $.fn.dataTable.ext.errMode = 'none';
+    _dtPatched = true;
+  }
+  function stripAjax(opts) {
+    if (!opts || typeof opts !== 'object') return opts;
+    var o = Object.assign({}, opts);
+    delete o.ajax;
+    delete o.serverSide;
+    return o;
+  }
+  ['DataTable', 'dataTable'].forEach(function(name) {
+    var orig = $.fn[name];
+    if (orig && !orig.__bp_patched__) {
+      $.fn[name] = function(opts) { return orig.call(this, stripAjax(opts)); };
+      $.fn[name].__bp_patched__ = true;
+      Object.assign($.fn[name], orig);
+    }
+  });
+  if ($.ajax && !$.__bp_ajax_patched__) {
+    var origAjax = $.ajax;
+    $.ajax = function(url, opts) {
+      var settings = (typeof url === 'object') ? url : Object.assign({url: url}, opts || {});
+      var target = (settings && settings.url) || '';
+      var isFr = false;
+      try {
+        var a = new URL(target, window.location.href);
+        isFr = (a.origin === window.location.origin || a.protocol === 'file:');
+      } catch(e) { isFr = !(/^https?:\/\//.test(target)); }
+      if (isFr) {
+        var emptyDT = {draw: 0, recordsTotal: 0, recordsFiltered: 0, data: []};
+        var dfd = $.Deferred ? $.Deferred() : null;
+        setTimeout(function() {
+          if (settings && typeof settings.success === 'function') {
+            try { settings.success(emptyDT, 'success', {}); } catch(e) {}
+          }
+          if (dfd) dfd.resolve(emptyDT, 'success', {});
+        }, 0);
+        if (dfd) return dfd.promise();
+        return {done: function(){return this;}, fail: function(){return this;}, always: function(){return this;}};
+      }
+      return origAjax.apply(this, arguments);
+    };
+    $.__bp_ajax_patched__ = true;
+  }
+}
+var _dtPollCount = 0;
+var _dtPollTimer = setInterval(function() {
+  patchDataTables();
+  _dtPollCount++;
+  if (_dtPatched || _dtPollCount > 200) clearInterval(_dtPollTimer);
+}, 50);
+
+console.log('[SiteBlueprint] Freeze shim active \u2014 AJAX blocked, DataTables patched for offline use.');
+})();
+`;
+  }
+
 
   // Generates the _blueprint_nav.js content with the full sitemap embedded.
   function generateBlueprintNavScript() {
@@ -1232,6 +1412,12 @@ document.addEventListener('DOMContentLoaded', () => {
     const navScriptContent = generateBlueprintNavScript();
     zip.file('_blueprint_nav.js', navScriptContent);
     log(`Offline nav script generated (_blueprint_nav.js) — ${Object.keys(siteMap).length} pages mapped.`, 'zip');
+
+    // Save freeze shim as a standalone file too (useful for manual debugging)
+    if (usedFreezeMode) {
+      zip.file('_blueprint_freeze_shim.js', generateFreezeShimInlineCode());
+      log('Freeze shim saved (_blueprint_freeze_shim.js) — AJAX blocker & DataTables patch included.', 'zip');
+    }
     
     statusDot.className = 'status-dot finished';
     statusText.textContent = 'CRAWLER STATUS: READY TO EXPORT';
