@@ -1,0 +1,38 @@
+{
+  "name": "siteblueprint-chrome-extension",
+  "version": "1.1.0",
+  "description": "Crawl and download any website as a clean, fully-functional offline local project. A Manifest V3 Chrome extension.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "lint": "eslint \"src/**/*.js\"",
+    "format": "prettier --write \"src/**/*.{js,css,html}\" \"*.{json,md}\"",
+    "build": "node scripts/build.mjs",
+    "zip": "node scripts/build.mjs"
+  },
+  "keywords": [
+    "chrome-extension",
+    "manifest-v3",
+    "web-crawler",
+    "website-downloader",
+    "offline",
+    "site-mirror",
+    "scraper",
+    "spa",
+    "archiver"
+  ],
+  "author": "Shahriar Ahmed (Seam)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shahriar-ahmed-seam/SiteBlueprint-Chrome-Extension.git"
+  },
+  "bugs": {
+    "url": "https://github.com/shahriar-ahmed-seam/SiteBlueprint-Chrome-Extension/issues"
+  },
+  "homepage": "https://github.com/shahriar-ahmed-seam/SiteBlueprint-Chrome-Extension#readme",
+  "devDependencies": {
+    "eslint": "^9.0.0",
+    "prettier": "^3.0.0"
+  }
+}

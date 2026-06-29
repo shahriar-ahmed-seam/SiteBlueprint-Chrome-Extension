@@ -26,29 +26,60 @@ Unlike typical scrapers, SiteBlueprint resolves routing paths locally and inject
 
 ## 🛠️ Project Structure
 
-The project is structured following modern extension design principles:
+The project follows a conventional, modular layout. Pure crawler logic lives in
+testable `engine/` modules, fully separated from DOM and orchestration code.
 
 ```
 SiteBlueprint-Chrome-Extension/
 ├── manifest.json            # Chrome extension MV3 manifest config
+├── package.json             # Project metadata + lint/format/build scripts
+├── LICENSE                  # MIT license
 ├── README.md                # Project documentation
-├── .gitignore               # Ignored system and build files
-├── icons/                   # Extension branding assets
-│   ├── icon-16.png          # Address bar and tab favicon
-│   ├── icon-48.png          # Extension management settings icon
-│   └── icon-128.png         # Chrome Web Store & launch icon
-├── libs/                    # Vendor libraries
-│   └── jszip.min.js         # JSZip library (v3.10.1) for ZIP packaging
-└── src/                     # Source files
-    ├── popup/               # Browser action popup component
-    │   ├── popup.html       # Quick launch/resume panel HTML
-    │   ├── popup.css        # Action popup styling
-    │   └── popup.js         # Popup logic for tab state querying
-    └── dashboard/           # Advanced compiler workspace component
+├── CHANGELOG.md             # Versioned change history
+├── CONTRIBUTING.md          # Contributor guide & architecture notes
+├── eslint.config.mjs        # ESLint flat config
+├── .prettierrc.json         # Prettier formatting rules
+├── .editorconfig            # Editor defaults
+├── .gitignore               # Ignored system, node and build files
+├── assets/
+│   └── icons/               # Extension branding assets (16 / 48 / 128 px)
+├── vendor/
+│   └── jszip.min.js         # JSZip library for client-side ZIP packaging
+├── scripts/
+│   └── build.mjs            # Dependency-free packaging script (-> dist/)
+└── src/
+    ├── popup/               # Toolbar action popup component
+    │   ├── popup.html       # Quick launch/resume panel
+    │   ├── popup.css        # Popup styling
+    │   └── popup.js         # Tab-state querying & launch logic
+    └── dashboard/           # Compiler workspace component
         ├── dashboard.html   # Main control panel UI
-        ├── dashboard.css    # Premium glassmorphic workspace styles
-        └── dashboard.js     # Crawler & path-rewriting core engine
+        ├── dashboard.css    # Glassmorphic workspace styles
+        ├── dashboard.js     # Controller: DOM wiring + crawl orchestration
+        └── engine/          # Pure, side-effect-free engine modules
+            ├── utils.js         # Formatting & small helpers
+            ├── paths.js         # URL → local path resolution & rewriting
+            ├── exclusions.js    # Exclusion pattern parsing & matching
+            ├── freeze-shim.js   # Freeze-mode AJAX/DataTables shim generator
+            └── offline-nav.js   # Offline navigation router generator
 ```
+
+---
+
+## 🧑‍💻 Development & Build
+
+Dev tooling is optional and only needed for linting, formatting, or packaging a
+release. The extension itself runs with zero build step — just **Load unpacked**.
+
+```bash
+npm install        # install eslint + prettier (dev only)
+npm run lint       # lint the source modules
+npm run format     # auto-format with prettier
+npm run build      # stage runtime files to dist/ and produce a store-ready zip
+```
+
+`npm run build` writes `dist/siteblueprint-v<version>.zip`, containing only the
+files Chrome needs (manifest, `src/`, `vendor/`, `assets/`, README and LICENSE).
 
 ---
 

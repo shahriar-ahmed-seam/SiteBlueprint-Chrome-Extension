@@ -1,6 +1,32 @@
-// SiteBlueprint Dashboard Scraper Engine
+/**
+ * @file dashboard.js
+ * @description SiteBlueprint dashboard controller. Wires the UI to the crawler
+ * engine, orchestrates the breadth-first crawl, asset compilation, offline
+ * rewriting and ZIP packaging. Pure logic (path resolution, exclusions, shim
+ * and nav generation) lives in ./engine/* and is imported here.
+ *
+ * `JSZip` is provided as a global by vendor/jszip.min.js (loaded before this
+ * module in dashboard.html).
+ */
+
+import {
+  sleep,
+  formatBytes,
+  formatTime,
+  getFileExtension,
+  classifyAssetType
+} from './engine/utils.js';
+import {
+  getLocalPathForUrl,
+  getRelativePath,
+  normalizeAssetUrl
+} from './engine/paths.js';
+import { parseExclusions, isExcluded } from './engine/exclusions.js';
+import { generateFreezeShimInlineCode } from './engine/freeze-shim.js';
+import { generateBlueprintNavScript } from './engine/offline-nav.js';
+
 document.addEventListener('DOMContentLoaded', () => {
-  // UI Elements
+  // ── UI Elements ───────────────────────────────────────────────────────────
   const startUrlInput = document.getElementById('start-url');
   const maxDepthSelect = document.getElementById('max-depth');
   const crawlDelayInput = document.getElementById('crawl-delay');
@@ -23,7 +49,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const tableSearch = document.getElementById('table-search');
   const blueprintTbody = document.getElementById('blueprint-tbody');
 
-  // Stats Elements
+  // Stats elements
   const statPages = document.getElementById('stat-pages');
   const statAssets = document.getElementById('stat-assets');
   const statQueueInfo = document.getElementById('stat-queue-info');
@@ -32,73 +58,64 @@ document.addEventListener('DOMContentLoaded', () => {
   const statSpeed = document.getElementById('stat-speed');
   const statTime = document.getElementById('stat-time');
 
-  // Engine Variables
+  // ── Engine configuration constants ──────────────────────────────────────────
+  const ASSET_TIMEOUT_MS = 15000; // per-asset fetch timeout
+  const ASSET_THROTTLE_MS = 50; // gap between asset downloads
+  const DEFAULT_FREEZE_WAIT_MS = 2500;
+
+  // ── Engine state ────────────────────────────────────────────────────────────
   let isRunning = false;
-  let isPaused = false;
   let startUrl = '';
   let startOrigin = '';
-  let loginUrl = ''; // Detected login page URL for redirect detection
-  let sessionInvalidated = false; // True once we detect a session redirect mid-crawl
+  let loginUrl = ''; // detected login page URL for redirect detection
+  let sessionInvalidated = false; // true once a mid-crawl session redirect is seen
   let maxDepth = 3;
   let crawlDelay = 300;
   let saveExternal = true;
-  let freezeMode = false;   // When true, capture real rendered DOM via tab
-  let freezeWait = 2500;   // ms to wait after page load for AJAX data
+  let freezeMode = false; // capture real rendered DOM via background tab
+  let freezeWait = DEFAULT_FREEZE_WAIT_MS;
+  let usedFreezeMode = false; // whether any page was frozen (for shim inclusion)
+  let exclusions = []; // parsed exclusion patterns for the active crawl
   let elapsedSeconds = 0;
-  let usedFreezeMode = false; // Track if any page was frozen (for shim file inclusion)
-  
-  // Queues and Lists
-  let queue = []; // Array of { url: '', depth: 0 }
-  let visited = new Map(); // Map of urlStr -> localPath
-  let assetsQueue = []; // Array of { url: '', localPath: '', type: '' }
-  let processedAssets = new Set(); // Set of URL strings
-  let localPathIndex = new Set(); // Set of local paths already saved (prevents duplicate overwrite)
-  let siteMap = {}; // Maps URL pathname -> localPath for offline navigation
-  let zip = null;
-  
-  // Stats Object
-  let stats = {
-    pagesCrawled: 0,
-    assetsGathered: 0,
-    totalSize: 0,
-    startTime: 0,
-    timerInterval: null,
-    counts: { css: 0, js: 0, img: 0, font: 0, other: 0 }
-  };
 
-  // DOM Rows Map
+  // Queues and lookup tables
+  let queue = []; // [{ url, depth }]
+  let visited = new Map(); // urlStr -> localPath
+  let assetsQueue = []; // [{ url, localPath, type }]
+  let processedAssets = new Set(); // asset URLs already handled
+  let localPathIndex = new Set(); // local paths already written (dedupe)
+  let siteMap = {}; // URL pathname -> localPath, for offline nav
+  let zip = null;
+
+  let stats = createEmptyStats();
   const urlToRowElements = new Map();
 
-  // Load URL from query parameters
-  const urlParams = new URLSearchParams(window.location.search);
-  const paramUrl = urlParams.get('url');
+  // ── Bootstrap from query string ─────────────────────────────────────────────
+  const paramUrl = new URLSearchParams(window.location.search).get('url');
   if (paramUrl) {
     try {
       const parsed = new URL(paramUrl);
       startUrlInput.value = parsed.href;
       domainBadge.textContent = parsed.hostname;
       log(`Detected active tab URL: ${parsed.href}`, 'highlight');
-    } catch (e) {
+    } catch (_) {
       log(`Invalid target URL passed in parameter: ${paramUrl}`, 'err');
     }
   }
 
-  // Pre-populate exclusion field with known destructive defaults
   if (!excludePatternsInput.value.trim()) {
     excludePatternsInput.value = 'logout, signout, log-out, sign-out';
   }
 
-  // Monitor target URL changes to update badge
+  // ── UI event wiring ──────────────────────────────────────────────────────────
   startUrlInput.addEventListener('input', (e) => {
     try {
-      const url = new URL(e.target.value.trim());
-      domainBadge.textContent = url.hostname;
-    } catch(err) {
+      domainBadge.textContent = new URL(e.target.value.trim()).hostname;
+    } catch (_) {
       domainBadge.textContent = 'Invalid URL';
     }
   });
 
-  // Freeze mode toggle wiring
   freezeModeCheckbox.addEventListener('change', () => {
     const isOn = freezeModeCheckbox.checked;
     freezeWaitGroup.style.display = isOn ? 'flex' : 'none';
@@ -108,327 +125,147 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  // Clear log console
   clearConsoleBtn.addEventListener('click', () => {
     terminalLog.innerHTML = '';
     log('Console logs cleared.', 'system');
   });
 
-  // Table Search Filter
   tableSearch.addEventListener('input', (e) => {
     const query = e.target.value.toLowerCase();
     for (const [url, elements] of urlToRowElements.entries()) {
       const pathText = elements.row.querySelector('.col-path').textContent.toLowerCase();
-      const urlText = url.toLowerCase();
-      if (pathText.includes(query) || urlText.includes(query)) {
-        elements.row.style.display = '';
-      } else {
-        elements.row.style.display = 'none';
-      }
+      const matches = pathText.includes(query) || url.toLowerCase().includes(query);
+      elements.row.style.display = matches ? '' : 'none';
     }
   });
 
-  // Setup Event Listeners for actions
   startBtn.addEventListener('click', startCrawling);
   stopBtn.addEventListener('click', stopCrawling);
   downloadZipBtn.addEventListener('click', downloadZip);
 
-  // Helper: Sleep utility
-  function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+  // ── Local helpers (DOM-bound) ────────────────────────────────────────────────
+  function createEmptyStats() {
+    return {
+      pagesCrawled: 0,
+      assetsGathered: 0,
+      totalSize: 0,
+      startTime: 0,
+      timerInterval: null,
+      counts: { css: 0, js: 0, img: 0, font: 0, other: 0 }
+    };
   }
 
-  // Helper: Log message to terminal console
+  /** Logs a message to the on-screen terminal console. */
   function log(message, type = 'info') {
     const line = document.createElement('div');
     line.className = `terminal-line ${type}-line`;
-    const time = new Date().toLocaleTimeString();
-    line.textContent = `[${time}] ${message}`;
+    line.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
     terminalLog.appendChild(line);
     terminalLog.scrollTop = terminalLog.scrollHeight;
   }
 
-  // Helper: Format size bytes
-  function formatBytes(bytes) {
-    if (bytes === 0) return '0 B';
-    const k = 1024;
-    const sizes = ['B', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-  }
-
-  // Helper: Format elapsed time
-  function formatTime(seconds) {
-    const mins = Math.floor(seconds / 60).toString().padStart(2, '0');
-    const secs = (seconds % 60).toString().padStart(2, '0');
-    return `${mins}:${secs}`;
-  }
-
-  // Helper: Extract file extension
-  function getFileExtension(urlStr) {
-    try {
-      const path = new URL(urlStr).pathname;
-      const lastSegment = path.split('/').pop();
-      if (lastSegment.includes('.')) {
-        return lastSegment.split('.').pop().split(/[?#]/)[0].toLowerCase();
-      }
-    } catch(e) {}
-    return '';
-  }
-
-  // ==========================================================================
-  // Path Resolution & Sanitization Engine
-  // ==========================================================================
-  
-  // Converts any URL into a relative local project path
-  function getLocalPathForUrl(urlStr, baseUrl) {
-    try {
-      const url = new URL(urlStr, baseUrl);
-      const base = new URL(baseUrl);
-      
-      if (url.origin === base.origin) {
-        return urlToLocalPath(url.href, base.origin);
-      } else {
-        // External Assets
-        let extPath = url.pathname;
-        if (extPath === '/' || extPath === '') {
-          extPath = '/index.html';
-        }
-        
-        let hostname = url.hostname;
-        // Clean hostname
-        hostname = hostname.replace(/[^a-zA-Z0-9.-]/g, '_');
-        
-        // Build path under external/
-        let fullPath = 'external/' + hostname + extPath;
-        
-        // Ensure directory endings have index.html
-        if (fullPath.endsWith('/')) {
-          fullPath += 'index.html';
-        }
-        
-        // Inject extension if it's dynamic
-        const lastSegment = fullPath.split('/').pop();
-        if (!lastSegment.includes('.')) {
-          // Check URL query parameters or default to .html
-          const ext = getFileExtension(urlStr);
-          fullPath += ext ? `.${ext}` : '.html';
-        }
-        
-        return fullPath;
-      }
-    } catch(e) {
-      // Fallback
-      return 'assets/corrupted_path';
-    }
-  }
-
-  // Internal path mapping rules
-  function urlToLocalPath(urlStr, domainOrigin) {
-    const url = new URL(urlStr);
-    let path = url.pathname;
-    let search = url.search;
-    
-    if (path === '/' || path === '') {
-      path = 'index.html';
-    } else {
-      // Decode
-      path = decodeURIComponent(path);
-      
-      // Remove leading slash
-      if (path.startsWith('/')) {
-        path = path.slice(1);
-      }
-      
-      // Handle trailing slash
-      if (path.endsWith('/')) {
-        path = path + 'index.html';
-      } else {
-        // Check if there is a file extension
-        const lastSegment = path.split('/').pop();
-        if (!lastSegment.includes('.')) {
-          path = path + '.html'; // Dynamic route like /purchases/create
-        }
-      }
-    }
-    
-    // Append search params as part of filename to support paginated or filtered views offline
-    if (search) {
-      // Sanitize search parameters: remove '?' and replace '&' / '=' with underscores
-      let sanitizedSearch = search.replace(/^\?/, '_').replace(/[&=]/g, '_').replace(/[^a-zA-Z0-9_-]/g, '');
-      if (sanitizedSearch.length > 40) {
-        sanitizedSearch = sanitizedSearch.slice(0, 40); // Cap length
-      }
-      
-      const dotIndex = path.lastIndexOf('.');
-      if (dotIndex !== -1) {
-        path = path.slice(0, dotIndex) + sanitizedSearch + path.slice(dotIndex);
-      } else {
-        path = path + sanitizedSearch;
-      }
-    }
-    
-    return path;
-  }
-
-  // Calculates a relative directory jump (e.g. "../" or "../../") from one local path to another
-  function getRelativePath(fromPath, toPath) {
-    const fromParts = fromPath.split('/');
-    fromParts.pop(); // Remove the filename itself
-    
-    if (fromParts.length === 0) {
-      return toPath;
-    }
-    
-    const upCount = fromParts.length;
-    const prefix = '../'.repeat(upCount);
-    return prefix + toPath;
-  }
-
-  // ==========================================================================
-  // Exclusions Parser
-  // ==========================================================================
-  function getExclusions() {
-    const text = excludePatternsInput.value;
-    return text.split(',')
-      .map(p => p.trim())
-      .filter(p => p.length > 0);
-  }
-
-  function isExcluded(pathname) {
-    const exclusions = getExclusions();
-    return exclusions.some(pattern => {
-      // Regex check: /pattern/
-      if (pattern.startsWith('/') && pattern.endsWith('/') && pattern.length > 2) {
-        try {
-          const regex = new RegExp(pattern.slice(1, -1), 'i');
-          return regex.test(pathname);
-        } catch(e) {}
-      }
-      // String check
-      return pathname.toLowerCase().includes(pattern.toLowerCase());
-    });
-  }
-
-  // ==========================================================================
-  // Interactive Table Builders
-  // ==========================================================================
+  // ── Interactive blueprint table ──────────────────────────────────────────────
   function addTableRow(urlStr, localPath, depth, type) {
     if (urlToRowElements.has(urlStr)) return;
-    
-    // Remove initial empty row
+
     const emptyRow = blueprintTbody.querySelector('.empty-row');
-    if (emptyRow) {
-      emptyRow.remove();
-    }
-    
+    if (emptyRow) emptyRow.remove();
+
     const tr = document.createElement('tr');
     tr.setAttribute('data-url', urlStr);
-    
+
     const tdPath = document.createElement('td');
     tdPath.className = 'col-path';
     tdPath.textContent = localPath;
     tr.appendChild(tdPath);
-    
+
     const tdUrl = document.createElement('td');
     tdUrl.className = 'col-url';
     tdUrl.textContent = urlStr;
     tdUrl.setAttribute('title', urlStr);
     tr.appendChild(tdUrl);
-    
+
     const tdDepth = document.createElement('td');
     tdDepth.textContent = depth === 0 ? 'Root' : depth;
     tr.appendChild(tdDepth);
-    
+
     const tdType = document.createElement('td');
     tdType.textContent = type;
     tr.appendChild(tdType);
-    
+
     const tdStatus = document.createElement('td');
     const spanBadge = document.createElement('span');
     spanBadge.className = 'badge pending';
     spanBadge.textContent = 'pending';
     tdStatus.appendChild(spanBadge);
     tr.appendChild(tdStatus);
-    
+
     const tdSize = document.createElement('td');
     tdSize.textContent = '--';
     tr.appendChild(tdSize);
-    
+
     blueprintTbody.appendChild(tr);
-    
-    // Cache UI references
-    urlToRowElements.set(urlStr, {
-      badge: spanBadge,
-      sizeCell: tdSize,
-      row: tr
-    });
+    urlToRowElements.set(urlStr, { badge: spanBadge, sizeCell: tdSize, row: tr });
   }
 
   function updateTableStatus(urlStr, status, localPath = null, sizeInBytes = null) {
     const elements = urlToRowElements.get(urlStr);
     if (!elements) return;
-    
+
     elements.badge.className = `badge ${status}`;
     elements.badge.textContent = status;
-    
-    if (localPath) {
-      elements.row.querySelector('.col-path').textContent = localPath;
-    }
-    
-    if (sizeInBytes !== null) {
-      elements.sizeCell.textContent = formatBytes(sizeInBytes);
-    }
+    if (localPath) elements.row.querySelector('.col-path').textContent = localPath;
+    if (sizeInBytes !== null) elements.sizeCell.textContent = formatBytes(sizeInBytes);
   }
 
-  // ==========================================================================
-  // Stats Display Updater
-  // ==========================================================================
+  // ── Stats display ────────────────────────────────────────────────────────────
   function updateStats() {
     statPages.textContent = stats.pagesCrawled;
     statAssets.textContent = stats.assetsGathered;
     statSize.textContent = formatBytes(stats.totalSize);
-    
-    // Queue details
     statQueueInfo.textContent = `Queue: ${queue.length} pending`;
-    
-    // Assets break-downs
-    statAssetsBreakdown.textContent = `CSS: ${stats.counts.css} | JS: ${stats.counts.js} | Img: ${stats.counts.img} | Font/Other: ${stats.counts.font + stats.counts.other}`;
-    
-    // Calculate speed
+    statAssetsBreakdown.textContent =
+      `CSS: ${stats.counts.css} | JS: ${stats.counts.js} | Img: ${stats.counts.img} | Font/Other: ${stats.counts.font + stats.counts.other}`;
+
     if (elapsedSeconds > 0) {
-      const speedMb = (stats.totalSize / (1024 * 1024)) / elapsedSeconds;
       const pagesSec = stats.pagesCrawled / elapsedSeconds;
       statSpeed.textContent = `Speed: ${pagesSec.toFixed(1)} p/s (${formatBytes(stats.totalSize / elapsedSeconds)}/s)`;
     } else {
-      statSpeed.textContent = `Speed: -- /s`;
+      statSpeed.textContent = 'Speed: -- /s';
     }
   }
 
-  // ==========================================================================
-  // Crawler Controller & Core BFS Logic
-  // ==========================================================================
+  function updateProgressBar() {
+    const totalDiscovered = urlToRowElements.size;
+    const completed = stats.pagesCrawled + processedAssets.size;
+    if (totalDiscovered > 0) {
+      const percentage = Math.min(100, Math.floor((completed / totalDiscovered) * 100));
+      progressBar.style.width = `${percentage}%`;
+      progressPercent.textContent = `${percentage}%`;
+    }
+  }
+
+  // ── Crawler controller ───────────────────────────────────────────────────────
   async function startCrawling() {
     if (isRunning) return;
-    
+
     const inputUrl = startUrlInput.value.trim();
     if (!inputUrl) {
       alert('Please enter a valid target URL.');
       return;
     }
-    
+
     try {
       const parsed = new URL(inputUrl);
       startUrl = parsed.href;
       startOrigin = parsed.origin;
-    } catch(e) {
+    } catch (_) {
       alert('Invalid URL structure. Please provide a full address, e.g. https://example.com');
       return;
     }
-    
-    // Clear state
+
+    // Reset engine state
     isRunning = true;
-    isPaused = false;
     sessionInvalidated = false;
     loginUrl = '';
     queue = [];
@@ -439,41 +276,34 @@ document.addEventListener('DOMContentLoaded', () => {
     siteMap = {};
     urlToRowElements.clear();
     blueprintTbody.innerHTML = '';
-    
-    maxDepth = parseInt(maxDepthSelect.value);
-    crawlDelay = parseInt(crawlDelayInput.value);
+
+    maxDepth = parseInt(maxDepthSelect.value, 10);
+    crawlDelay = parseInt(crawlDelayInput.value, 10);
     saveExternal = saveExternalCheckbox.checked;
     freezeMode = freezeModeCheckbox.checked;
-    freezeWait = parseInt(freezeWaitInput.value) || 2500;
-    usedFreezeMode = freezeMode; // track for finalizeCrawl
-    
+    freezeWait = parseInt(freezeWaitInput.value, 10) || DEFAULT_FREEZE_WAIT_MS;
+    usedFreezeMode = freezeMode;
+    exclusions = parseExclusions(excludePatternsInput.value);
+
     zip = new JSZip();
-    
-    stats = {
-      pagesCrawled: 0,
-      assetsGathered: 0,
-      totalSize: 0,
-      startTime: Date.now(),
-      counts: { css: 0, js: 0, img: 0, font: 0, other: 0 }
-    };
+    stats = createEmptyStats();
+    stats.startTime = Date.now();
     elapsedSeconds = 0;
-    
-    // UI states
+
     startBtn.disabled = true;
     stopBtn.disabled = false;
     downloadZipBtn.disabled = true;
-    
+
     statusDot.className = 'status-dot running';
     statusText.textContent = 'CRAWLER STATUS: RUNNING';
     domainBadge.textContent = new URL(startUrl).hostname;
-    
+
     log(`Initializing SiteBlueprint crawler core for: ${startUrl}`, 'system');
     log(`Options configured - Max Depth: ${maxDepth === 999 ? 'Unlimited' : maxDepth}, Delay: ${crawlDelay}ms, Save CDNs: ${saveExternal}, Freeze Mode: ${freezeMode ? '❄ ON (render wait: ' + freezeWait + 'ms)' : 'off'}`, 'system');
     if (freezeMode) {
       log('❄ Freeze mode: each page will be loaded in a real browser tab. Data visible in Chrome will be frozen into the saved HTML.', 'freeze');
     }
-    
-    // Start elapsed timer
+
     statTime.textContent = '00:00';
     if (stats.timerInterval) clearInterval(stats.timerInterval);
     stats.timerInterval = setInterval(() => {
@@ -481,13 +311,11 @@ document.addEventListener('DOMContentLoaded', () => {
       statTime.textContent = formatTime(elapsedSeconds);
       updateStats();
     }, 1000);
-    
-    // Add start URL to queue
+
     const rootPath = getLocalPathForUrl(startUrl, startUrl);
     queue.push({ url: startUrl, depth: 0 });
     addTableRow(startUrl, rootPath, 0, 'HTML Page (Root)');
-    
-    // Trigger compilation
+
     try {
       await crawlEngine();
     } catch (err) {
@@ -503,42 +331,37 @@ document.addEventListener('DOMContentLoaded', () => {
     finalizeCrawl();
   }
 
-  // ==========================================================================
-  // Page Fetching: fetch() mode vs. Freeze (tab-based DOM capture) mode
-  // ==========================================================================
-
+  // ── Page fetching: fetch() mode vs Freeze (tab DOM capture) mode ──────────────
   /**
    * Unified page fetch entry point.
-   * In normal mode  : uses fetch() with credentials (fast, no JS rendering).
-   * In freeze mode  : opens a background Chrome tab, waits for the page to
-   *                   fully render (including AJAX data), captures outerHTML,
-   *                   then closes the tab.
-   * Returns { htmlText, finalUrl, contentType }
+   * - Normal mode: fetch() with credentials (fast, no JS rendering).
+   * - Freeze mode: open a background tab, wait for render, capture outerHTML.
+   * @returns {Promise<{htmlText:string, finalUrl:string, contentType:string}>}
    */
   async function fetchPageHtml(url) {
     if (!freezeMode) {
-      // ── Standard fetch path ───────────────────────────────────────────────
       const response = await fetch(url, { credentials: 'include' });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const contentType = response.headers.get('Content-Type') || '';
-      const finalUrl = response.url;
       const htmlText = contentType.includes('text/html') ? await response.text() : '';
-      return { htmlText, finalUrl, contentType };
+      return { htmlText, finalUrl: response.url, contentType };
     }
+    return freezeCapture(url);
+  }
 
-    // ── Freeze mode: tab-based DOM capture ────────────────────────────────
+  /** Freeze-mode capture: render the page in a background tab and snapshot it. */
+  function freezeCapture(url) {
     return new Promise((resolve, reject) => {
       let tabId = null;
       let settled = false;
-      const TIMEOUT = Math.max(freezeWait + 15000, 20000); // hard safety timeout
+      const TIMEOUT = Math.max(freezeWait + 15000, 20000);
 
       const cleanup = () => {
         if (tabId !== null) {
-          chrome.tabs.remove(tabId, () => { /* ignore */ });
+          chrome.tabs.remove(tabId, () => {});
           tabId = null;
         }
       };
-
       const fail = (msg) => {
         if (settled) return;
         settled = true;
@@ -546,32 +369,26 @@ document.addEventListener('DOMContentLoaded', () => {
         reject(new Error(msg));
       };
 
-      // Safety timeout so a hung page never blocks the queue forever
       const timeoutHandle = setTimeout(() => fail(`Freeze timeout after ${TIMEOUT}ms`), TIMEOUT);
 
-      // Listen for the tab finishing loading
       const onUpdated = (tid, changeInfo) => {
         if (tid !== tabId || changeInfo.status !== 'complete') return;
         chrome.tabs.onUpdated.removeListener(onUpdated);
 
-        // Wait extra time for AJAX/JS to render data
         setTimeout(async () => {
           if (settled) return;
           try {
-            // Capture the tab's final URL (handle redirects)
             const tab = await chrome.tabs.get(tabId);
             const finalUrl = tab.url || url;
             const contentType = finalUrl.match(/\.(css|js|png|jpg|jpeg|gif|webp|svg|ico|woff|woff2|ttf|eot)($|\?)/i)
               ? 'application/octet-stream'
               : 'text/html';
 
-            // Inject script to capture fully rendered outerHTML
-            // First, inject the freeze shim inline so DataTables AJAX calls
-            // are blocked BEFORE outerHTML is serialised (the shim stays in
-            // the HTML and runs again when the user opens the local page).
+            // Inline the freeze shim BEFORE serialising so DataTables AJAX is
+            // blocked and the shim persists in the saved HTML.
             const shimScript = generateFreezeShimInlineCode();
             await chrome.scripting.executeScript({
-              target: { tabId: tabId },
+              target: { tabId },
               func: (shim) => {
                 const s = document.createElement('script');
                 s.id = '__bp_shim_marker__';
@@ -582,7 +399,7 @@ document.addEventListener('DOMContentLoaded', () => {
             });
 
             const results = await chrome.scripting.executeScript({
-              target: { tabId: tabId },
+              target: { tabId },
               func: () => document.documentElement.outerHTML
             });
 
@@ -598,8 +415,6 @@ document.addEventListener('DOMContentLoaded', () => {
       };
 
       chrome.tabs.onUpdated.addListener(onUpdated);
-
-      // Open a background (inactive) tab
       chrome.tabs.create({ url, active: false }, (tab) => {
         if (chrome.runtime.lastError) {
           chrome.tabs.onUpdated.removeListener(onUpdated);
@@ -607,105 +422,61 @@ document.addEventListener('DOMContentLoaded', () => {
           return;
         }
         tabId = tab.id;
-        // If tab is already complete (e.g. cached page), fire immediately
-        if (tab.status === 'complete') {
-          onUpdated(tabId, { status: 'complete' });
-        }
+        if (tab.status === 'complete') onUpdated(tabId, { status: 'complete' });
       });
     });
   }
 
-  // ---- Login / Auth redirect detection helpers ----
-
-  // Patterns that indicate a login page redirect
+  // ── Login / auth redirect detection ──────────────────────────────────────────
   const LOGIN_PATTERNS = [/\/login/, /\/signin/, /\/sign-in/, /\/auth/, /\/session\/new/];
 
   function isLoginUrl(urlStr) {
     try {
       const path = new URL(urlStr).pathname.toLowerCase();
-      return LOGIN_PATTERNS.some(re => re.test(path));
-    } catch(e) { return false; }
+      return LOGIN_PATTERNS.some((re) => re.test(path));
+    } catch (_) {
+      return false;
+    }
   }
 
   function isRedirectedToLogin(requestedUrl, finalUrl) {
     if (requestedUrl === finalUrl) return false;
-    // If we already know the login URL, check directly
     if (loginUrl && finalUrl === loginUrl) return true;
-    // Detect by path pattern
     return isLoginUrl(finalUrl);
   }
 
   async function crawlEngine() {
     while (queue.length > 0 && isRunning) {
       const current = queue.shift();
-      
-      // Skip if already crawled
-      if (visited.has(current.url)) {
-        continue;
-      }
+      if (visited.has(current.url)) continue;
 
-      // If session was invalidated, mark remaining queue items and stop
       if (sessionInvalidated) {
         log(`Skipping ${current.url} — session expired, remaining queue cleared.`, 'warn');
         updateTableStatus(current.url, 'warning');
         continue;
       }
-      
+
       log(`${freezeMode ? '❄ Freezing' : 'Loading'} target: ${current.url}`, 'info');
       updateTableStatus(current.url, 'downloading');
-      
+
       try {
         const { htmlText, finalUrl, contentType } = await fetchPageHtml(current.url);
 
-        // ── Auth redirect detection ─────────────────────────────────────────
         if (isRedirectedToLogin(current.url, finalUrl)) {
-          // Record the login URL so further redirects are caught immediately
-          if (!loginUrl) {
-            loginUrl = finalUrl;
-            log(`Auth redirect detected! Login page identified as: ${finalUrl}`, 'warn');
-          }
-
-          // If this is the FIRST auth redirect (login page itself), save it once
-          if (!localPathIndex.has('login.html') && !visited.has(finalUrl)) {
-            const loginLocalPath = getLocalPathForUrl(finalUrl, startUrl);
-            const parser = new DOMParser();
-            const doc = parser.parseFromString(htmlText, 'text/html');
-            processHtmlDocument(doc, finalUrl, current.depth);
-            injectOfflineNav(doc, loginLocalPath);
-            const serializedHtml = '<!DOCTYPE html>\n' + doc.documentElement.outerHTML;
-            zip.file(loginLocalPath, serializedHtml);
-            localPathIndex.add(loginLocalPath);
-            try { siteMap[new URL(finalUrl).pathname] = loginLocalPath; } catch(e) {}
-            visited.set(finalUrl, loginLocalPath);
-            stats.pagesCrawled++;
-            stats.totalSize += serializedHtml.length;
-            log(`Login page saved: ${loginLocalPath}`, 'ok');
-            updateTableStatus(current.url, 'warning', loginLocalPath, serializedHtml.length);
-          } else {
-            // Subsequent pages redirect to login = session is now gone
-            sessionInvalidated = true;
-            visited.set(current.url, 'login.html'); // map so we don't re-queue
-            log(`[AUTH] Session expired — ${current.url} redirected to login. Queued pages will be skipped.`, 'warn');
-            updateTableStatus(current.url, 'warning', '⚠ auth-required');
-          }
-
+          handleAuthRedirect(current, finalUrl, htmlText);
           updateStats();
           updateProgressBar();
-          continue; // do NOT process this page's links — avoid crawling login form links
+          continue;
         }
-        // ── End auth redirect detection ──────────────────────────────────────
-        
-        // Map original URL to local path
+
         const localPath = getLocalPathForUrl(finalUrl, startUrl);
         visited.set(current.url, localPath);
-        
-        // Handle redirect mappings
+
         if (finalUrl !== current.url) {
           visited.set(finalUrl, localPath);
           log(`Redirected to: ${finalUrl} (Mapped to: ${localPath})`, 'info');
         }
 
-        // Skip if we already stored this local path from another URL (duplicate redirect)
         if (localPathIndex.has(localPath)) {
           log(`Duplicate path skipped: ${localPath} (already saved)`, 'info');
           updateTableStatus(current.url, 'success', localPath);
@@ -713,63 +484,45 @@ document.addEventListener('DOMContentLoaded', () => {
           updateProgressBar();
           continue;
         }
-        
+
         if (contentType.includes('text/html')) {
-          // Parse DOM (htmlText already resolved above)
-          const parser = new DOMParser();
-          const doc = parser.parseFromString(htmlText, 'text/html');
-          
-          // Process and crawl nodes
+          const doc = new DOMParser().parseFromString(htmlText, 'text/html');
           processHtmlDocument(doc, finalUrl, current.depth);
-
-          // Register in sitemap for offline nav
-          try { siteMap[new URL(finalUrl).pathname] = localPath; } catch(e) {}
-
-          // Inject offline navigation interceptor
+          try { siteMap[new URL(finalUrl).pathname] = localPath; } catch (_) {}
           injectOfflineNav(doc, localPath);
 
-          // Serialize and bundle HTML
           const serializedHtml = '<!DOCTYPE html>\n' + doc.documentElement.outerHTML;
           zip.file(localPath, serializedHtml);
           localPathIndex.add(localPath);
-          
           stats.pagesCrawled++;
           stats.totalSize += serializedHtml.length;
-          
+
           log(`Saved page: ${localPath} (${formatBytes(serializedHtml.length)})`, 'ok');
           updateTableStatus(current.url, 'success', localPath, serializedHtml.length);
-          
         } else {
-          // Non-HTML content type from a page URL — store the raw text as-is
-          // (In freeze mode we only get text; in fetch mode we'd need a re-fetch
-          //  for a true blob, but page URLs rarely serve binary content.)
           const rawText = htmlText || '';
-          
           zip.file(localPath, rawText);
           localPathIndex.add(localPath);
           stats.assetsGathered++;
           stats.totalSize += rawText.length;
           stats.counts.other++;
-          
+
           log(`Saved non-HTML resource: ${localPath} (${formatBytes(rawText.length)})`, 'ok');
           updateTableStatus(current.url, 'success', localPath, rawText.length);
         }
-        
       } catch (err) {
         log(`${freezeMode ? 'Freeze' : 'Fetch'} failure on: ${current.url} - ${err.message}`, 'err');
         updateTableStatus(current.url, 'error');
       }
-      
-      // Update stats and progress bar
+
       updateStats();
       updateProgressBar();
-      
-      // Throttle delay
+
       if (queue.length > 0 && crawlDelay > 0 && isRunning) {
         await sleep(crawlDelay);
       }
     }
-    
+
     if (isRunning) {
       if (sessionInvalidated) {
         log('Warning: Session expired mid-crawl. Some pages could not be captured. Proceed to download what was collected.', 'warn');
@@ -780,381 +533,301 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  // Update progress bar helper
-  function updateProgressBar() {
-    const totalDiscovered = urlToRowElements.size;
-    const completed = stats.pagesCrawled + processedAssets.size;
-    if (totalDiscovered > 0) {
-      const percentage = Math.min(100, Math.floor((completed / totalDiscovered) * 100));
-      progressBar.style.width = `${percentage}%`;
-      progressPercent.textContent = `${percentage}%`;
+  /** Handles a page that redirected to a login screen. */
+  function handleAuthRedirect(current, finalUrl, htmlText) {
+    if (!loginUrl) {
+      loginUrl = finalUrl;
+      log(`Auth redirect detected! Login page identified as: ${finalUrl}`, 'warn');
+    }
+
+    if (!localPathIndex.has('login.html') && !visited.has(finalUrl)) {
+      const loginLocalPath = getLocalPathForUrl(finalUrl, startUrl);
+      const doc = new DOMParser().parseFromString(htmlText, 'text/html');
+      processHtmlDocument(doc, finalUrl, current.depth);
+      injectOfflineNav(doc, loginLocalPath);
+
+      const serializedHtml = '<!DOCTYPE html>\n' + doc.documentElement.outerHTML;
+      zip.file(loginLocalPath, serializedHtml);
+      localPathIndex.add(loginLocalPath);
+      try { siteMap[new URL(finalUrl).pathname] = loginLocalPath; } catch (_) {}
+      visited.set(finalUrl, loginLocalPath);
+      stats.pagesCrawled++;
+      stats.totalSize += serializedHtml.length;
+
+      log(`Login page saved: ${loginLocalPath}`, 'ok');
+      updateTableStatus(current.url, 'warning', loginLocalPath, serializedHtml.length);
+    } else {
+      sessionInvalidated = true;
+      visited.set(current.url, 'login.html');
+      log(`[AUTH] Session expired — ${current.url} redirected to login. Queued pages will be skipped.`, 'warn');
+      updateTableStatus(current.url, 'warning', '⚠ auth-required');
     }
   }
 
-  // ==========================================================================
-  // DOM Link and Asset Scraping/Rewriting Parser
-  // ==========================================================================
+  // ── DOM link & asset scraping / rewriting ─────────────────────────────────────
   function processHtmlDocument(doc, pageUrl, currentDepth) {
     const sourceLocalPath = getLocalPathForUrl(pageUrl, startUrl);
-    
-    // Inject UTF-8 meta charset if missing
-    let hasCharset = false;
+
+    ensureCharsetMeta(doc);
+    rewriteAnchors(doc, pageUrl, sourceLocalPath, currentDepth);
+    rewriteResourceTags(doc, pageUrl, sourceLocalPath);
+    rewriteForms(doc, pageUrl);
+    rewriteInlineStyles(doc, pageUrl, sourceLocalPath);
+  }
+
+  function ensureCharsetMeta(doc) {
     const metas = doc.querySelectorAll('meta');
     for (const meta of metas) {
       if (meta.getAttribute('charset') || meta.getAttribute('http-equiv')?.toLowerCase() === 'content-type') {
-        hasCharset = true;
-        break;
+        return;
       }
     }
-    if (!hasCharset) {
-      const charsetMeta = doc.createElement('meta');
-      charsetMeta.setAttribute('charset', 'UTF-8');
-      doc.head.insertBefore(charsetMeta, doc.head.firstChild);
-    }
+    const charsetMeta = doc.createElement('meta');
+    charsetMeta.setAttribute('charset', 'UTF-8');
+    doc.head.insertBefore(charsetMeta, doc.head.firstChild);
+  }
 
-    // 1. Process <a> Links
-    const links = doc.querySelectorAll('a[href]');
-    for (const link of links) {
+  function rewriteAnchors(doc, pageUrl, sourceLocalPath, currentDepth) {
+    for (const link of doc.querySelectorAll('a[href]')) {
       const href = link.getAttribute('href');
-      if (!href || href.startsWith('#') || href.startsWith('javascript:') || href.startsWith('mailto:') || href.startsWith('tel:')) {
-        continue;
-      }
-      
+      if (!href || /^(#|javascript:|mailto:|tel:)/.test(href)) continue;
+
       try {
         const absoluteUrl = new URL(href, pageUrl).href;
         const parsedUrl = new URL(absoluteUrl);
-        
-        // In-domain filter
+
         if (parsedUrl.origin === startOrigin) {
-          if (isExcluded(parsedUrl.pathname)) {
-            continue; // Skip excluded URLs
-          }
-          
+          if (isExcluded(parsedUrl.pathname, exclusions)) continue;
+
           const targetLocalPath = getLocalPathForUrl(absoluteUrl, startUrl);
-          const relPath = getRelativePath(sourceLocalPath, targetLocalPath);
-          
-          link.setAttribute('href', relPath);
-          
-          // Queue for crawl if within depth bounds and not visited
-          if (!visited.has(absoluteUrl) && !queue.some(item => item.url === absoluteUrl)) {
-            if (currentDepth < maxDepth) {
-              queue.push({ url: absoluteUrl, depth: currentDepth + 1 });
-              addTableRow(absoluteUrl, targetLocalPath, currentDepth + 1, 'HTML Page');
-            }
+          link.setAttribute('href', getRelativePath(sourceLocalPath, targetLocalPath));
+
+          const alreadyQueued = visited.has(absoluteUrl) || queue.some((item) => item.url === absoluteUrl);
+          if (!alreadyQueued && currentDepth < maxDepth) {
+            queue.push({ url: absoluteUrl, depth: currentDepth + 1 });
+            addTableRow(absoluteUrl, targetLocalPath, currentDepth + 1, 'HTML Page');
           }
         } else {
-          // External link
-          link.setAttribute('href', absoluteUrl);
+          link.setAttribute('href', absoluteUrl); // keep external links absolute
         }
-      } catch(e) {}
+      } catch (_) {}
     }
+  }
 
-    // Helper: Asset handler for elements
-    function handleAssetTag(element, attrName, type) {
-      const attrValue = element.getAttribute(attrName);
-      if (!attrValue || attrValue.startsWith('data:')) return;
-      
-      try {
-        const absoluteUrl = new URL(attrValue, pageUrl).href;
-        const targetLocalPath = getLocalPathForUrl(absoluteUrl, startUrl);
-        const relPath = getRelativePath(sourceLocalPath, targetLocalPath);
-        
-        element.setAttribute(attrName, relPath);
-        enqueueAsset(absoluteUrl, targetLocalPath, type);
-      } catch(e) {}
-    }
+  function handleAssetTag(element, attrName, type, pageUrl, sourceLocalPath) {
+    const attrValue = element.getAttribute(attrName);
+    if (!attrValue || attrValue.startsWith('data:')) return;
+    try {
+      const absoluteUrl = new URL(attrValue, pageUrl).href;
+      const targetLocalPath = getLocalPathForUrl(absoluteUrl, startUrl);
+      element.setAttribute(attrName, getRelativePath(sourceLocalPath, targetLocalPath));
+      enqueueAsset(absoluteUrl, type);
+    } catch (_) {}
+  }
 
-    // 2. Process Stylesheets & Icons
-    const linkTags = doc.querySelectorAll('link[href]');
-    for (const tag of linkTags) {
+  function rewriteResourceTags(doc, pageUrl, sourceLocalPath) {
+    // Stylesheets & icons
+    for (const tag of doc.querySelectorAll('link[href]')) {
       const rel = tag.getAttribute('rel')?.toLowerCase() || '';
       if (rel.includes('stylesheet')) {
-        handleAssetTag(tag, 'href', 'css');
+        handleAssetTag(tag, 'href', 'css', pageUrl, sourceLocalPath);
       } else if (rel.includes('icon') || rel.includes('apple-touch-icon') || rel.includes('image')) {
-        handleAssetTag(tag, 'href', 'img');
+        handleAssetTag(tag, 'href', 'img', pageUrl, sourceLocalPath);
       }
     }
 
-    // 3. Process Scripts
-    const scriptTags = doc.querySelectorAll('script[src]');
-    for (const tag of scriptTags) {
-      handleAssetTag(tag, 'src', 'js');
+    // Scripts
+    for (const tag of doc.querySelectorAll('script[src]')) {
+      handleAssetTag(tag, 'src', 'js', pageUrl, sourceLocalPath);
     }
 
-    // 4. Process Images
-    const imgTags = doc.querySelectorAll('img');
-    for (const tag of imgTags) {
-      if (tag.hasAttribute('src')) {
-        handleAssetTag(tag, 'src', 'img');
-      }
+    // Images
+    for (const tag of doc.querySelectorAll('img')) {
+      if (tag.hasAttribute('src')) handleAssetTag(tag, 'src', 'img', pageUrl, sourceLocalPath);
       if (tag.hasAttribute('srcset')) {
-        const srcsetVal = tag.getAttribute('srcset');
-        const rewrittenSrcset = rewriteSrcset(srcsetVal, pageUrl, sourceLocalPath);
-        tag.setAttribute('srcset', rewrittenSrcset);
+        tag.setAttribute('srcset', rewriteSrcset(tag.getAttribute('srcset'), pageUrl, sourceLocalPath));
       }
     }
 
-    // 5. Process Media Elements
-    const mediaTags = doc.querySelectorAll('video, audio, source, track');
-    for (const tag of mediaTags) {
-      if (tag.hasAttribute('src')) {
-        handleAssetTag(tag, 'src', 'media');
-      }
+    // Media
+    for (const tag of doc.querySelectorAll('video, audio, source, track')) {
+      if (tag.hasAttribute('src')) handleAssetTag(tag, 'src', 'media', pageUrl, sourceLocalPath);
       if (tag.hasAttribute('srcset')) {
-        const srcsetVal = tag.getAttribute('srcset');
-        const rewrittenSrcset = rewriteSrcset(srcsetVal, pageUrl, sourceLocalPath);
-        tag.setAttribute('srcset', rewrittenSrcset);
+        tag.setAttribute('srcset', rewriteSrcset(tag.getAttribute('srcset'), pageUrl, sourceLocalPath));
       }
     }
+  }
 
-    // 6. Fix Form Action Paths to ensure online submission integrity
-    const forms = doc.querySelectorAll('form[action]');
-    for (const form of forms) {
+  function rewriteForms(doc, pageUrl) {
+    for (const form of doc.querySelectorAll('form[action]')) {
       const action = form.getAttribute('action');
       if (action && !action.startsWith('#') && !action.startsWith('javascript:')) {
         try {
           form.setAttribute('action', new URL(action, pageUrl).href);
-        } catch (e) {}
+        } catch (_) {}
       }
-    }
-
-    // 7. Styles Blocks (<style>)
-    const styleTags = doc.querySelectorAll('style');
-    for (const tag of styleTags) {
-      const rewrittenCss = rewriteStyleContent(tag.textContent, pageUrl, sourceLocalPath);
-      tag.textContent = rewrittenCss;
-    }
-
-    // 8. Inline Style Attributes
-    const inlineStyles = doc.querySelectorAll('[style]');
-    for (const tag of inlineStyles) {
-      const styleAttr = tag.getAttribute('style');
-      const rewrittenCss = rewriteStyleContent(styleAttr, pageUrl, sourceLocalPath);
-      tag.setAttribute('style', rewrittenCss);
     }
   }
 
-  // Helper: Normalize asset URL — strips fragment (#iefix, #glyph, etc.) and
-  // empty query strings that browsers add for IE compat but don't affect the file.
-  // e.g. font.eot?#iefix and font.eot?v=2.0.0#iefix all → font.eot
-  const ASSET_EXTS = new Set(['eot','woff','woff2','ttf','otf','svg','png','jpg','jpeg','gif','webp','ico','mp4','mp3','wav','pdf']);
-
-  function normalizeAssetUrl(urlStr) {
-    try {
-      const url = new URL(urlStr);
-      url.hash = ''; // Strip #iefix, #glyph, etc. — never changes the downloaded file
-      // Strip query if it's empty (just '?') or if this is a binary asset (cache-bust only)
-      const ext = url.pathname.split('.').pop().toLowerCase();
-      if (url.search === '?' || ASSET_EXTS.has(ext)) {
-        url.search = '';
-      }
-      return url.href;
-    } catch(e) { return urlStr; }
+  function rewriteInlineStyles(doc, pageUrl, sourceLocalPath) {
+    for (const tag of doc.querySelectorAll('style')) {
+      tag.textContent = rewriteStyleContent(tag.textContent, pageUrl, sourceLocalPath);
+    }
+    for (const tag of doc.querySelectorAll('[style]')) {
+      tag.setAttribute('style', rewriteStyleContent(tag.getAttribute('style'), pageUrl, sourceLocalPath));
+    }
   }
 
-  // Helper: Enqueue assets
-  function enqueueAsset(urlStr, localPath, type) {
-    // Normalize away fragment/IE-compat suffixes before deduplication
+  /** Enqueues an asset for download, deduplicating by normalized URL & path. */
+  function enqueueAsset(urlStr, type) {
     const normUrl = normalizeAssetUrl(urlStr);
     const normPath = getLocalPathForUrl(normUrl, startUrl);
 
     if (visited.has(normUrl) || processedAssets.has(normUrl)) return;
-    // Also skip if this local file path was already saved or queued under a different URL
     if (localPathIndex.has(normPath)) return;
-    
-    // Check external filters
+
     try {
-      const url = new URL(normUrl);
-      const isExternal = url.origin !== startOrigin;
-      
-      if (isExternal && !saveExternal) {
-        return;
-      }
-      
-      if (!assetsQueue.some(item => item.url === normUrl)) {
+      const isExternal = new URL(normUrl).origin !== startOrigin;
+      if (isExternal && !saveExternal) return;
+
+      if (!assetsQueue.some((item) => item.url === normUrl)) {
         assetsQueue.push({ url: normUrl, localPath: normPath, type });
         addTableRow(normUrl, normPath, '--', type.toUpperCase());
       }
-    } catch(e) {}
+    } catch (_) {}
   }
 
-  // Helper: Rewrites srcset values
   function rewriteSrcset(srcsetStr, baseUrl, sourceLocalPath) {
-    const parts = srcsetStr.split(',');
-    const rewrittenParts = parts.map(part => {
-      const trimmed = part.trim();
-      if (!trimmed) return part;
-      
-      const segments = trimmed.split(/\s+/);
-      const urlStr = segments[0];
-      try {
-        const absoluteUrl = new URL(urlStr, baseUrl).href;
-        const targetLocalPath = getLocalPathForUrl(absoluteUrl, startUrl);
-        const relPath = getRelativePath(sourceLocalPath, targetLocalPath);
-        
-        // Extract type
-        const ext = getFileExtension(absoluteUrl);
-        const type = ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp'].includes(ext) ? 'img' : 'other';
-        
-        enqueueAsset(absoluteUrl, targetLocalPath, type);
-        segments[0] = relPath;
-        return segments.join(' ');
-      } catch(e) {
-        return part;
-      }
-    });
-    return rewrittenParts.join(', ');
+    return srcsetStr
+      .split(',')
+      .map((part) => {
+        const trimmed = part.trim();
+        if (!trimmed) return part;
+        const segments = trimmed.split(/\s+/);
+        try {
+          const absoluteUrl = new URL(segments[0], baseUrl).href;
+          const targetLocalPath = getLocalPathForUrl(absoluteUrl, startUrl);
+          const ext = getFileExtension(absoluteUrl);
+          const type = classifyAssetType(ext) === 'img' ? 'img' : 'other';
+          enqueueAsset(absoluteUrl, type);
+          segments[0] = getRelativePath(sourceLocalPath, targetLocalPath);
+          return segments.join(' ');
+        } catch (_) {
+          return part;
+        }
+      })
+      .join(', ');
   }
 
-  // Helper: Scanner for URL styles in HTML attributes/style tags
+  /** Rewrites url(...) references inside inline style content/attributes. */
   function rewriteStyleContent(cssContent, sourceUrl, sourceLocalPath) {
     return cssContent.replace(/url\(\s*['"]?([^'")]+)['"]?\s*\)/g, (match, urlStr) => {
       if (urlStr.startsWith('data:')) return match;
       try {
         const absoluteUrl = new URL(urlStr, sourceUrl).href;
         const targetLocalPath = getLocalPathForUrl(absoluteUrl, startUrl);
-        const relPath = getRelativePath(sourceLocalPath, targetLocalPath);
-        
-        // Determine type
-        const ext = getFileExtension(absoluteUrl);
-        let type = 'other';
-        if (['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp'].includes(ext)) type = 'img';
-        else if (['woff', 'woff2', 'ttf', 'otf', 'eot'].includes(ext)) type = 'font';
-        
-        enqueueAsset(absoluteUrl, targetLocalPath, type);
-        return `url('${relPath}')`;
-      } catch(e) {
+        enqueueAsset(absoluteUrl, classifyAssetType(getFileExtension(absoluteUrl)));
+        return `url('${getRelativePath(sourceLocalPath, targetLocalPath)}')`;
+      } catch (_) {
         return match;
       }
     });
   }
 
-  // ==========================================================================
-  // Asset Downloader & CSS Sub-Asset Scanner Loop
-  // ==========================================================================
+  // ── Asset downloader & nested CSS scanner ─────────────────────────────────────
   async function downloadAssets() {
     statusDot.className = 'status-dot running';
     statusText.textContent = 'CRAWLER STATUS: COMPILING ASSETS';
     log('Initiating compilation for stylesheet, scripts, images, and fonts...', 'system');
-    
-    // Process queue with a while loop as CSS parses might append nested assets dynamically
+
     while (assetsQueue.length > 0 && isRunning) {
       const asset = assetsQueue.shift();
       if (processedAssets.has(asset.url)) continue;
       processedAssets.add(asset.url);
-      
+
       log(`Downloading asset: ${asset.url}`, 'info');
       updateTableStatus(asset.url, 'downloading');
-      
-      // Per-asset timeout (15 seconds) so a hung request never blocks the queue
+
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 15000);
+      const timeoutId = setTimeout(() => controller.abort(), ASSET_TIMEOUT_MS);
 
       try {
         const response = await fetch(asset.url, { signal: controller.signal });
         clearTimeout(timeoutId);
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-        
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
         if (asset.type === 'css') {
-          // Parse and rewrite nested background images/fonts inside CSS files
           let cssContent = await response.text();
-          cssContent = rewriteCssUrls(cssContent, asset.url, startUrl);
-          
+          cssContent = rewriteCssUrls(cssContent, asset.url);
           zip.file(asset.localPath, cssContent);
           localPathIndex.add(asset.localPath);
           stats.assetsGathered++;
           stats.totalSize += cssContent.length;
           stats.counts.css++;
-          
           log(`Compiled CSS: ${asset.localPath}`, 'ok');
           updateTableStatus(asset.url, 'success', asset.localPath, cssContent.length);
         } else {
-          // Save standard binary asset
           const blob = await response.blob();
           zip.file(asset.localPath, blob);
           localPathIndex.add(asset.localPath);
           stats.assetsGathered++;
           stats.totalSize += blob.size;
-          
-          // Increment stats counts
           if (asset.type === 'js') stats.counts.js++;
           else if (asset.type === 'img') stats.counts.img++;
           else if (asset.type === 'font') stats.counts.font++;
           else stats.counts.other++;
-          
           log(`Saved asset: ${asset.localPath} (${formatBytes(blob.size)})`, 'ok');
           updateTableStatus(asset.url, 'success', asset.localPath, blob.size);
         }
       } catch (err) {
         clearTimeout(timeoutId);
         if (err.name === 'AbortError') {
-          log(`Asset timed out (15s): ${asset.url}`, 'warn');
+          log(`Asset timed out (${ASSET_TIMEOUT_MS / 1000}s): ${asset.url}`, 'warn');
           updateTableStatus(asset.url, 'warning');
         } else {
           log(`Asset failed: ${asset.url} — ${err.message}`, 'err');
           updateTableStatus(asset.url, 'error');
         }
       }
-      
+
       updateStats();
       updateProgressBar();
-      
-      // Short delay between asset downloads to limit server hits
+
       if (assetsQueue.length > 0 && isRunning) {
-        await sleep(50);
+        await sleep(ASSET_THROTTLE_MS);
       }
     }
-    
+
     if (isRunning) {
       log('All asset downloads completed successfully.', 'system');
       finalizeCrawl();
     }
   }
 
-  // Scans CSS content for nested assets and updates them
-  function rewriteCssUrls(cssContent, cssUrl, baseUrl) {
-    const cssLocalPath = getLocalPathForUrl(cssUrl, baseUrl);
-    
+  /** Scans CSS content for nested assets, enqueues them and rewrites URLs. */
+  function rewriteCssUrls(cssContent, cssUrl) {
+    const cssLocalPath = getLocalPathForUrl(cssUrl, startUrl);
     return cssContent.replace(/url\(\s*['"]?([^'")]+)['"]?\s*\)/g, (match, urlStr) => {
       if (urlStr.startsWith('data:')) return match;
       try {
         const absoluteUrl = new URL(urlStr, cssUrl).href;
-        const targetLocalPath = getLocalPathForUrl(absoluteUrl, baseUrl);
-        const relPath = getRelativePath(cssLocalPath, targetLocalPath);
-        
-        // Enqueue discovered sub-asset
-        const ext = getFileExtension(absoluteUrl);
-        let type = 'other';
-        if (['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp'].includes(ext)) type = 'img';
-        else if (['woff', 'woff2', 'ttf', 'otf', 'eot'].includes(ext)) type = 'font';
-        
-        enqueueAsset(absoluteUrl, targetLocalPath, type);
-        return `url('${relPath}')`;
-      } catch(e) {
+        const targetLocalPath = getLocalPathForUrl(absoluteUrl, startUrl);
+        enqueueAsset(absoluteUrl, classifyAssetType(getFileExtension(absoluteUrl)));
+        return `url('${getRelativePath(cssLocalPath, targetLocalPath)}')`;
+      } catch (_) {
         return match;
       }
     });
   }
 
-  // ==========================================================================
-  // Offline Navigation Helpers
-  // ==========================================================================
-
-  // Injects the __BP_DEPTH__ marker and a reference to _blueprint_nav.js into
-  // each saved page so links & SPA routing work locally.
-  // For frozen pages the freeze shim is ALREADY embedded inline by the tab
-  // capture step; we add a reference to the external file only as a fallback.
+  // ── Offline navigation injection ──────────────────────────────────────────────
   function injectOfflineNav(doc, localPath) {
     const depth = localPath.split('/').length - 1;
     const rel = depth > 0 ? '../'.repeat(depth) : '';
 
-    // Depth marker (read by the nav script)
     const depthScript = doc.createElement('script');
     depthScript.textContent = `window.__BP_DEPTH__=${depth};`;
 
-    // Reference to the shared nav interceptor at ZIP root
     const navScript = doc.createElement('script');
     navScript.setAttribute('src', rel + '_blueprint_nav.js');
 
@@ -1163,8 +836,8 @@ document.addEventListener('DOMContentLoaded', () => {
       doc.head.appendChild(navScript);
     }
 
-    // For freeze-mode pages that were NOT processed through the tab capture
-    // (e.g. the login redirect page saved from normal fetch), inject shim inline.
+    // For freeze-mode pages saved via normal fetch (e.g. login redirect),
+    // inline the shim since the tab-capture step never ran.
     if (freezeMode && !doc.getElementById('__bp_shim_marker__')) {
       const shimScript = doc.createElement('script');
       shimScript.id = '__bp_shim_marker__';
@@ -1173,285 +846,60 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  // ==========================================================================
-  // Freeze Shim: blocks XHR/fetch & patches DataTables for offline use
-  // ==========================================================================
-
-  /**
-   * Returns the JS source for the freeze shim embedded into every frozen HTML page.
-   *
-   * ROOT CAUSE FIX (v2): The previous version used setInterval(50ms) to patch jQuery
-   * which was too slow - page scripts had already called DataTables({ajax:...}) by
-   * the time the patch fired, causing DataTables to re-fetch data (clearing frozen rows).
-   *
-   * NEW APPROACH: Use Object.defineProperty on window.jQuery / window.$ to intercept
-   * the moment jQuery is assigned to the global scope. At that exact moment we:
-   *  a) Patch $.ajax to silently swallow all same-origin requests
-   *  b) Add a $(document).ready() callback that runs BEFORE page init callbacks
-   *     (because we add it here, before page scripts are even parsed), which
-   *     patches DataTables constructors to strip the ajax: option entirely -
-   *     so DataTables never re-fetches and frozen DOM rows are preserved.
-   *
-   * NOTE: This function uses string concatenation (not template literals) because
-   * it is itself inside a template literal in dashboard.js - backticks inside
-   * would break the outer literal.
-   */
-  function generateFreezeShimInlineCode() {
-    return (
-      '/* SiteBlueprint Freeze Shim v2 -- auto-injected, do not edit */\n' +
-      '(function(){\n' +
-      '"use strict";\n' +
-      'if(window.__BP_SHIM_ACTIVE__)return;\n' +
-      'window.__BP_SHIM_ACTIVE__=true;\n' +
-      '\n' +
-      '/* 0. Suppress DataTables alert popups */\n' +
-      'var _na=window.alert;\n' +
-      'window.alert=function(m){if(typeof m==="string"&&m.indexOf("DataTables")!==-1){console.warn("[BP-Shim] suppressed:",m);return;}_na.apply(this,arguments);};\n' +
-      '\n' +
-      '/* 1. isLocal helper */\n' +
-      'function isLocal(url){\n' +
-      '  if(!url||url==="")return true;\n' +
-      '  try{var a=new URL(url,window.location.href);return a.origin===window.location.origin||a.protocol==="file:";}catch(e){return!(/^https?:\\/\\//.test(url));}\n' +
-      '}\n' +
-      '\n' +
-      '/* 2. XHR stub -- handles addEventListener("load",...) used by modern jQuery */\n' +
-      'var _NXHR=window.XMLHttpRequest;\n' +
-      'window.XMLHttpRequest=function(){\n' +
-      '  var real=new _NXHR(),_f=false,_ev={},_self=this;\n' +
-      '  _self.open=function(m,url){_f=isLocal(url);if(!_f)real.open.apply(real,arguments);};\n' +
-      '  _self.send=function(){\n' +
-      '    if(!_f){real.send.apply(real,arguments);return;}\n' +
-      '    _self.status=200;_self.statusText="OK";_self.readyState=4;\n' +
-      '    var d=\'{"draw":1,"recordsTotal":0,"recordsFiltered":0,"data":[]}\';\n' +
-      '    _self.responseText=d;_self.response=d;\n' +
-      '    setTimeout(function(){\n' +
-      '      (_ev.readystatechange||[]).forEach(function(fn){try{fn();}catch(e){}});\n' +
-      '      (_ev.load||[]).forEach(function(fn){try{fn({});}catch(e){}});\n' +
-      '      if(typeof _self.onreadystatechange==="function")try{_self.onreadystatechange();}catch(e){}\n' +
-      '      if(typeof _self.onload==="function")try{_self.onload({});}catch(e){}\n' +
-      '    },0);\n' +
-      '  };\n' +
-      '  _self.addEventListener=function(evt,fn){if(_f){(_ev[evt]=_ev[evt]||[]).push(fn);}else real.addEventListener.apply(real,arguments);};\n' +
-      '  _self.removeEventListener=function(evt,fn){if(!_f)real.removeEventListener.apply(real,arguments);};\n' +
-      '  _self.setRequestHeader=function(k,v){if(!_f)real.setRequestHeader(k,v);};\n' +
-      '  _self.getResponseHeader=function(k){if(_f)return(k||"").toLowerCase()==="content-type"?"application/json":null;return real.getResponseHeader(k);};\n' +
-      '  _self.getAllResponseHeaders=function(){if(_f)return"content-type: application/json\\r\\n";return real.getAllResponseHeaders();};\n' +
-      '  _self.abort=function(){if(!_f)real.abort();};\n' +
-      '  _self.overrideMimeType=function(m){if(!_f)try{real.overrideMimeType(m);}catch(e){}};\n' +
-      '  ["timeout","withCredentials","responseType","upload"].forEach(function(p){\n' +
-      '    Object.defineProperty(_self,p,{get:function(){try{return real[p];}catch(e){return null;}},set:function(v){try{real[p]=v;}catch(e){}},configurable:true});\n' +
-      '  });\n' +
-      '};\n' +
-      '\n' +
-      '/* 3. fetch() stub */\n' +
-      'var _nf=window.fetch;\n' +
-      'window.fetch=function(input,init){\n' +
-      '  var url=typeof input==="string"?input:((input&&input.url)||"");\n' +
-      '  if(isLocal(url)){\n' +
-      '    var b=\'{"draw":1,"recordsTotal":0,"recordsFiltered":0,"data":[]}\';\n' +
-      '    return Promise.resolve(new Response(b,{status:200,headers:{"Content-Type":"application/json"}}));\n' +
-      '  }\n' +
-      '  return _nf.apply(this,arguments);\n' +
-      '};\n' +
-      '\n' +
-      '/* 4. jQuery / DataTables patches */\n' +
-      '/* KEY: patch $.ajax the instant jQuery loads via property interceptor */\n' +
-      'function applyDT($){\n' +
-      '  if(!$||!$.fn)return;\n' +
-      '  if($.fn.dataTable&&$.fn.dataTable.ext){$.fn.dataTable.ext.errMode="none";}\n' +
-      '  function strip(cfg){if(!cfg||typeof cfg!=="object")return cfg;var c=Object.assign({},cfg);delete c.ajax;delete c.serverSide;return c;}\n' +
-      '  ["DataTable","dataTable"].forEach(function(n){\n' +
-      '    var orig=$.fn[n];\n' +
-      '    if(orig&&!orig.__bp__){$.fn[n]=function(cfg){return orig.call(this,strip(cfg));};$.fn[n].__bp__=true;Object.assign($.fn[n],orig);}\n' +
-      '  });\n' +
-      '}\n' +
-      'function patchJQ($){\n' +
-      '  if(!$||!$.fn||$.__bp_done__)return;\n' +
-      '  $.__bp_done__=true;\n' +
-      '  /* a) patch $.ajax immediately so all AJAX calls are intercepted */\n' +
-      '  if($.ajax){\n' +
-      '    var _oa=$.ajax;\n' +
-      '    $.ajax=function(u,o){\n' +
-      '      var cfg=typeof u==="object"?u:Object.assign({url:u},o||{});\n' +
-      '      if(isLocal((cfg&&cfg.url)||"")){\n' +
-      '        var e={draw:1,recordsTotal:0,recordsFiltered:0,data:[]};\n' +
-      '        var dfd=$.Deferred?$.Deferred():null;\n' +
-      '        setTimeout(function(){if(cfg&&typeof cfg.success==="function")try{cfg.success(e,"success",null);}catch(ex){}if(dfd)dfd.resolveWith(null,[e,"success",null]);},0);\n' +
-      '        if(dfd)return dfd.promise();\n' +
-      '        return{done:function(){return this;},fail:function(){return this;},always:function(){return this;}};\n' +
-      '      }\n' +
-      '      return _oa.apply(this,arguments);\n' +
-      '    };\n' +
-      '  }\n' +
-      '  /* b) add ready callback at FRONT of queue -- runs before page init scripts */\n' +
-      '  $(document).ready(function(){\n' +
-      '    applyDT($);\n' +
-      '    if($.fn.dataTable&&$.fn.dataTable.ext)$.fn.dataTable.ext.errMode="none";\n' +
-      '  });\n' +
-      '  applyDT($);\n' +
-      '}\n' +
-      'function interceptJQ(name){\n' +
-      '  var _v;\n' +
-      '  try{\n' +
-      '    Object.defineProperty(window,name,{\n' +
-      '      configurable:true,enumerable:true,\n' +
-      '      get:function(){return _v;},\n' +
-      '      set:function(v){_v=v;if(v&&v.fn)try{patchJQ(v);}catch(e){}}\n' +
-      '    });\n' +
-      '  }catch(e){}\n' +
-      '}\n' +
-      '/* Patch immediately if already present */\n' +
-      'if(window.jQuery&&window.jQuery.fn)patchJQ(window.jQuery);\n' +
-      'if(window.$&&window.$.fn&&window.$!==window.jQuery)patchJQ(window.$);\n' +
-      '/* Intercept future assignments */\n' +
-      'interceptJQ("jQuery");interceptJQ("$");\n' +
-      '/* Fallback poll in case defineProperty was overridden */\n' +
-      'var _ft=setInterval(function(){var jq=window.jQuery||window.$;if(jq&&jq.fn&&!jq.__bp_done__)patchJQ(jq);},30);\n' +
-      'setTimeout(function(){clearInterval(_ft);},15000);\n' +
-      '\n' +
-      'console.log("[SiteBlueprint] Freeze shim v2 active -- sync jQuery intercept.");\n' +
-      '})();\n'
-    );
-  }
-  // Generates the _blueprint_nav.js content with the full sitemap embedded.
-  function generateBlueprintNavScript() {
-    const mapJson = JSON.stringify(siteMap);
-    return `/* SiteBlueprint v1.0 — Offline Navigation Interceptor
- * Auto-generated. Do not edit.
- * Sitemap entries: ${Object.keys(siteMap).length} pages
- */
-(function () {
-  'use strict';
-  const sitemap = ${mapJson};
-  const depth   = window.__BP_DEPTH__ || 0;
-  const up      = '../'.repeat(depth);
-
-  function resolve(href) {
-    if (!href) return null;
-    const h = href.trim();
-    if (h.charAt(0) === '#' || /^(mailto|tel|javascript|data):/.test(h)) return null;
-    let pn;
-    try {
-      pn = /^https?:\/\//.test(h)
-        ? new URL(h).pathname
-        : new URL(h, window.location.href).pathname;
-    } catch (e) { return null; }
-    pn = decodeURIComponent(pn).replace(/\/+$/, '') || '/';
-    const lp = sitemap[pn] || sitemap[pn + '/'];
-    return lp ? up + lp : null;
-  }
-
-  /* 1. Anchor click interception (capture phase = fires before any SPA router) */
-  document.addEventListener('click', function (e) {
-    const a = e.target.closest('a[href]');
-    if (!a) return;
-    const f = resolve(a.getAttribute('href'));
-    if (f) {
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      window.location.href = f;
-    }
-  }, true);
-
-  /* 2. SPA history.pushState interception */
-  const _ps = history.pushState.bind(history);
-  history.pushState = function (s, t, url) {
-    if (url) { const f = resolve(String(url)); if (f) { window.location.href = f; return; } }
-    return _ps(s, t, url);
-  };
-
-  /* 3. SPA history.replaceState interception */
-  const _rs = history.replaceState.bind(history);
-  history.replaceState = function (s, t, url) {
-    if (url) { const f = resolve(String(url)); if (f) { window.location.replace(f); return; } }
-    return _rs(s, t, url);
-  };
-
-  /* 4. Patch <a> tags that SPA frameworks create dynamically */
-  if (window.MutationObserver) {
-    new MutationObserver(function (mutations) {
-      mutations.forEach(function (m) {
-        m.addedNodes.forEach(function (node) {
-          if (node.nodeType !== 1) return;
-          (node.tagName === 'A' ? [node] : Array.from(node.querySelectorAll('a[href]'))).forEach(function(a) {
-            const href = a.getAttribute('href');
-            const f = resolve(href);
-            if (f) a.setAttribute('href', f);
-          });
-        });
-      });
-    }).observe(document.body || document.documentElement, { childList: true, subtree: true });
-  }
-
-  console.log('[SiteBlueprint] Offline nav active | depth:', depth, '| pages in map:', Object.keys(sitemap).length);
-})();
-`;
-  }
-
-  // ==========================================================================
-  // Crawler Finalization & ZIP Packaging
-  // ==========================================================================
+  // ── Finalization & ZIP packaging ──────────────────────────────────────────────
   function finalizeCrawl() {
     isRunning = false;
-    if (stats.timerInterval) {
-      clearInterval(stats.timerInterval);
-    }
+    if (stats.timerInterval) clearInterval(stats.timerInterval);
 
-    // Generate & save offline navigation script
-    const navScriptContent = generateBlueprintNavScript();
-    zip.file('_blueprint_nav.js', navScriptContent);
+    zip.file('_blueprint_nav.js', generateBlueprintNavScript(siteMap));
     log(`Offline nav script generated (_blueprint_nav.js) — ${Object.keys(siteMap).length} pages mapped.`, 'zip');
 
-    // Save freeze shim as a standalone file too (useful for manual debugging)
     if (usedFreezeMode) {
       zip.file('_blueprint_freeze_shim.js', generateFreezeShimInlineCode());
       log('Freeze shim saved (_blueprint_freeze_shim.js) — AJAX blocker & DataTables patch included.', 'zip');
     }
-    
+
     statusDot.className = 'status-dot finished';
     statusText.textContent = 'CRAWLER STATUS: READY TO EXPORT';
     progressBar.style.width = '100%';
     progressPercent.textContent = '100%';
-    
+
     startBtn.disabled = false;
     stopBtn.disabled = true;
     downloadZipBtn.disabled = false;
-    
+
     log(`Compilation sequence finished. Final totals - Pages: ${stats.pagesCrawled}, Assets: ${stats.assetsGathered}, Total Zip Weight: ${formatBytes(stats.totalSize)}`, 'highlight');
     log('Ready to generate offline package. Click "Download Offline ZIP" to save.', 'zip');
   }
 
   async function downloadZip() {
     if (!zip) return;
-    
+
     downloadZipBtn.disabled = true;
     statusDot.className = 'status-dot packaging';
     statusText.textContent = 'CRAWLER STATUS: PACKAGING ARCHIVE';
     log('Packaging offline blueprint files into a structured ZIP file. Please wait...', 'zip');
-    
+
     try {
       const content = await zip.generateAsync({ type: 'blob' }, (metadata) => {
         const percent = metadata.percent.toFixed(0);
         progressPercent.textContent = `${percent}%`;
         progressBar.style.width = `${percent}%`;
       });
-      
-      const parsedUrl = new URL(startUrl);
-      let filename = parsedUrl.hostname;
-      // Clean filename
-      filename = filename.replace(/[^a-zA-Z0-9]/g, '_') + '_blueprint.zip';
-      
+
+      const filename = new URL(startUrl).hostname.replace(/[^a-zA-Z0-9]/g, '_') + '_blueprint.zip';
       log(`Archiving completed. Initiating browser download for: ${filename}`, 'ok');
-      
+
       const link = document.createElement('a');
       link.href = URL.createObjectURL(content);
       link.download = filename;
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
-      
+      URL.revokeObjectURL(link.href);
+
       log('Download successfully completed!', 'ok');
-    } catch(err) {
+    } catch (err) {
       log(`Error generating ZIP file: ${err.message}`, 'err');
     } finally {
       statusDot.className = 'status-dot finished';
